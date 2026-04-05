@@ -1,58 +1,67 @@
-# KidGuard global config
-
-paths:
-  skeleton_data_dir: "data/skeleton"
-  video_data_dir: "data/video"
-  output_events_dir: "outputs/events"
-  output_metrics_dir: "outputs/metrics"
-
-skeleton:
-  standard: "COCO-17"
-  keypoint_names:
-    - "nose"
-    - "left_eye"
-    - "right_eye"
-    - "left_ear"
-    - "right_ear"
-    - "left_shoulder"
-    - "right_shoulder"
-    - "left_elbow"
-    - "right_elbow"
-    - "left_wrist"
-    - "right_wrist"
-    - "left_hip"
-    - "right_hip"
-    - "left_knee"
-    - "right_knee"
-    - "left_ankle"
-    - "right_ankle"
-
-rules:
-  proximity_threshold: 0.3
-  wrist_intrusion_threshold: 0.15
-  velocity_threshold: 0.05
-  conflict_duration_frames: 8
-  teacher_presence_threshold: 0.5
-
-state_machine:
-  enabled: false
-  states:
-    - "NORMAL"
-    - "APPROACHING"
-    - "CONTACT"
-    - "CONFLICT"
-    - "RESOLVED"
-  approach_frames: 5
-  contact_frames: 3
-  conflict_frames: 8
-  resolve_frames: 10
-
 dataset:
-  ntu_conflict_actions: [49, 50, 51]
-  ntu_normal_actions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-
+  ntu_conflict_actions:
+  - 49
+  - 50
+  - 51
+  ntu_normal_actions:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
 output:
   save_events_csv: true
   save_events_json: false
   save_metrics_csv: true
   visualization_enabled: false
+paths:
+  output_events_dir: outputs/events
+  output_metrics_dir: outputs/metrics
+  skeleton_data_dir: data/skeleton
+  video_data_dir: data/video
+rules:
+  alert_threshold: 0.3
+  conflict_duration_frames: 8
+  proximity_threshold: 0.3
+  proximity_window_frames: 5
+  smoothing_window_frames: 5
+  teacher_presence_threshold: 0.5
+  velocity_threshold: 0.05
+  wrist_intrusion_threshold: 0.15
+skeleton:
+  keypoint_names:
+  - nose
+  - left_eye
+  - right_eye
+  - left_ear
+  - right_ear
+  - left_shoulder
+  - right_shoulder
+  - left_elbow
+  - right_elbow
+  - left_wrist
+  - right_wrist
+  - left_hip
+  - right_hip
+  - left_knee
+  - right_knee
+  - left_ankle
+  - right_ankle
+  standard: COCO-17
+state_machine:
+  approach_frames: 5
+  conflict_frames: 8
+  contact_frames: 3
+  enabled: false
+  resolve_frames: 10
+  states:
+  - NORMAL
+  - APPROACHING
+  - CONTACT
+  - CONFLICT
+  - RESOLVED
