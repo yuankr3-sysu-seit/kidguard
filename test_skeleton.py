@@ -1,71 +1,40 @@
-import sys, os, csv
+import sys
+import os
 sys.path.insert(0, "src")
 
-from fightguard.inputs.skeleton_source import load_dataset
+from fightguard.inputs.video_source import process_video_to_trackset
 from fightguard.detection.interaction_rules import run_rules_symmetric
 from fightguard.config import get_config
 
-cfg      = get_config()
-data_dirs = [
-    "D:/dataset_1/nturgbd_skeletons_s001_to_s017",
-    "D:/dataset_1/nturgbd_skeletons_s018_to_s032",
-]
+cfg = get_config()
 
-# 加载500个clip做更可靠的评估
-track_sets = load_dataset(data_dirs, max_clips=500)
+# 找一个 fight 文件夹里的视频来测试
+video_dir = "D:/dataset_1/five_dataset/fight"
+# 获取目录下的第一个视频文件
+video_files = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.avi', '.mpg'))]
 
-tp = fp = tn = fn = 0
-rows = []  # 用于写CSV
+if not video_files:
+    print("未找到视频文件，请检查路径。")
+else:
+    test_video = os.path.join(video_dir, video_files[0])
+    print(f"[INFO] 准备处理视频：{test_video}")
+    
+    # 为了测试速度，我们只处理前 60 帧（约 2 秒）
+    print("[INFO] 开始提取骨骼 (使用 YOLOv8-Pose CPU 模式)...")
+    print("[INFO] 开始提取骨骼 (开启 BoT-SORT 追踪)...")
+    track_set = process_video_to_trackset(test_video, label=1, cfg=cfg) # 去掉 max_frames
 
-for ts in track_sets:
-    events    = run_rules_symmetric(ts, cfg)
-    predicted = 1 if events else 0
-    actual    = ts.label
-    top_score = round(max((e.score for e in events), default=0.0), 4)
-    top_rules = str(events[0].triggered_rules) if events else "[]"
-
-    if actual == 1 and predicted == 1: tp += 1
-    elif actual == 0 and predicted == 1: fp += 1
-    elif actual == 0 and predicted == 0: tn += 1
-    elif actual == 1 and predicted == 0: fn += 1
-
-    rows.append({
-        "clip_id":   ts.clip_id,
-        "actual":    actual,
-        "predicted": predicted,
-        "result":    "TP" if actual==1 and predicted==1 else
-                     "FP" if actual==0 and predicted==1 else
-                     "TN" if actual==0 and predicted==0 else "FN",
-        "top_score": top_score,
-        "rules":     top_rules,
-    })
-
-# ── 写入CSV ──────────────────────────────────────────────────
-os.makedirs("outputs/metrics", exist_ok=True)
-csv_path = "outputs/metrics/eval_results.csv"
-with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
-
-# ── 输出最终指标 ──────────────────────────────────────────────
-total     = tp + fp + tn + fn
-recall    = tp / (tp + fn)    if (tp + fn) > 0 else 0.0
-precision = tp / (tp + fp)    if (tp + fp) > 0 else 1.0
-fpr       = fp / (tn + fp)    if (tn + fp) > 0 else 0.0
-acc       = (tp + tn) / total if total > 0       else 0.0
-f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-
-print(f"{'='*55}")
-print(f"  KidGuard 基础版规则流 — 正式评测报告")
-print(f"  数据集：NTU RGBD s001~s032  样本数：{total}")
-print(f"  冲突样本：{tp+fn}   正常样本：{tn+fp}")
-print(f"{'='*55}")
-print(f"  TP={tp}  FP={fp}  TN={tn}  FN={fn}")
-print(f"  Accuracy  (准确率) : {acc:.4f}")
-print(f"  Precision (精确率) : {precision:.4f}")
-print(f"  Recall    (召回率) : {recall:.4f}")
-print(f"  F1 Score           : {f1:.4f}")
-print(f"  FPR       (误报率) : {fpr:.4f}")
-print(f"{'='*55}")
-print(f"  结果已保存至：{csv_path}")
+    if track_set:
+        print(f"[SUCCESS] 骨骼提取成功！总帧数: {track_set.total_frames}, 检测到人数: {len(track_set.tracks)}")
+        
+        print("[INFO] 开始运行规则引擎...")
+        events = run_rules_symmetric(track_set, cfg)
+        
+        if events:
+            e = events[0]
+            print(f"[ALARM] 发现冲突！帧 {e.start_frame}~{e.end_frame}, 得分: {e.score:.3f}")
+            print(f"        触发规则: {e.triggered_rules}")
+        else:
+            print("[OK] 规则引擎未报告冲突。")
+    else:
+        print("[FAILED] 骨骼提取失败或未检测到人。")
