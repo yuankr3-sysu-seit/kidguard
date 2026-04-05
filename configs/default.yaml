@@ -1,27 +1,13 @@
+# KidGuard global config
 
----
-
-#### **文件三：`kidguard/configs/default.yaml`​**
-
-这是整个系统的"控制面板"，所有阈值、路径都在这里统一管理，规则代码里不允许出现硬编码数字。内容我已按照队长纲领的要求预设好了合理的初始值，后续调参只需改这个文件。
-
-```yaml
-# ============================================================
-# KidGuard 全局配置文件
-# 阶段1/2 通用 | 修改阈值只需改此文件，无需动业务代码
-# ============================================================
-
-# ---------- 路径配置 ----------
 paths:
-  skeleton_data_dir: "data/skeleton"       # NTU骨骼数据根目录
-  video_data_dir:    "data/video"          # 视频数据根目录
-  output_events_dir: "outputs/events"      # 事件输出目录
-  output_metrics_dir: "outputs/metrics"    # 指标输出目录
+  skeleton_data_dir: "data/skeleton"
+  video_data_dir: "data/video"
+  output_events_dir: "outputs/events"
+  output_metrics_dir: "outputs/metrics"
 
-# ---------- 骨骼关键点标准 ----------
 skeleton:
-  standard: "COCO-17"                      # 统一使用COCO-17标准
-  # COCO-17 关键点名称（顺序与索引对应，仅供参考，代码中用字典键名调用）
+  standard: "COCO-17"
   keypoint_names:
     - "nose"
     - "left_eye"
@@ -41,50 +27,32 @@ skeleton:
     - "left_ankle"
     - "right_ankle"
 
-# ---------- 规则判定阈值（阶段一核心调参区域）----------
 rules:
-  # 近身距离阈值：两人躯干中心点距离小于此值，视为"近身"
-  # 单位：归一化坐标（0~1），相对于画面高度
   proximity_threshold: 0.3
-
-  # 手腕侵入阈值：一方手腕进入另一方躯干范围，视为"肢体接触"
   wrist_intrusion_threshold: 0.15
-
-  # 速度阈值：手腕移动速度（帧间位移）超过此值，视为"快速动作"
   velocity_threshold: 0.05
-
-  # 持续时间阈值：满足近身+接触条件持续超过此帧数，触发冲突报警
   conflict_duration_frames: 8
-
-  # 教师在场判定：教师与事件区域的距离阈值
   teacher_presence_threshold: 0.5
 
-# ---------- 状态机配置（进阶版启用）----------
 state_machine:
-  enabled: false                           # 阶段一先关闭，进阶版开启
+  enabled: false
   states:
     - "NORMAL"
     - "APPROACHING"
     - "CONTACT"
     - "CONFLICT"
     - "RESOLVED"
-  # 各状态转移所需的持续帧数
   approach_frames: 5
   contact_frames: 3
   conflict_frames: 8
   resolve_frames: 10
 
-# ---------- 数据集配置 ----------
 dataset:
-  # NTU RGBD 中与冲突相关的动作类别编号
-  # A049=punching, A050=kicking, A051=pushing
   ntu_conflict_actions: [49, 50, 51]
-  # 非冲突动作采样（用于计算FPR），从以下类别中随机采样
   ntu_normal_actions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-# ---------- 输出配置 ----------
 output:
   save_events_csv: true
   save_events_json: false
   save_metrics_csv: true
-  visualization_enabled: false             # 阶段一暂不启用可视化
+  visualization_enabled: false
