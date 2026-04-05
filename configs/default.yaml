@@ -27,7 +27,7 @@ paths:
 rules:
   alert_threshold: 0.3
   conflict_duration_frames: 8
-  proximity_threshold: 0.3
+  proximity_threshold: 0.5
   proximity_window_frames: 5
   smoothing_window_frames: 5
   teacher_presence_threshold: 0.5

@@ -538,7 +538,71 @@ def run_rules_on_clip(
     # Step1: 配对
     pairs = get_interaction_pairs(track_set, cfg)
     if not pairs:
+        # 单人clip降级处理：只用施力方自身特征评分
+        # 当clip只有1人时，无法做双人配对，
+        # 改为检测该人自身的爆发性动作（高腕部加速度+高肘部角加速度）
+        if len(track_set.tracks) == 1:
+            track_a = track_set.tracks[0]
+            solo_scores = []
+            for fi in range(len(track_a.keypoints)):
+                if fi < 2:
+                    solo_scores.append(0.0)
+                    continue
+                from fightguard.detection.interaction_rules import (
+                    compute_wrist_acceleration,
+                    compute_elbow_angular_acceleration,
+                    normalize_feature,
+                )
+                dt = 1.0 / track_set.fps
+                a_A     = max(
+                    compute_wrist_acceleration(track_a, fi, dt, "right"),
+                    compute_wrist_acceleration(track_a, fi, dt, "left"),
+                )
+                alpha_A = max(
+                    compute_elbow_angular_acceleration(track_a, fi, dt, "right"),
+                    compute_elbow_angular_acceleration(track_a, fi, dt, "left"),
+                )
+                score = 0.6 * normalize_feature(a_A, 0.0, 50.0) + \
+                        0.4 * normalize_feature(alpha_A, 0.0, 100.0)
+                solo_scores.append(score)
+
+            smoothed  = sliding_window_avg(solo_scores,
+                            cfg["rules"].get("smoothing_window_frames", 5))
+            threshold = cfg["rules"].get("alert_threshold", 0.3)
+            in_event  = False
+            event_start = 0
+            for idx, avg_score in enumerate(smoothed):
+                if avg_score > threshold and not in_event:
+                    in_event    = True
+                    event_start = idx
+                elif avg_score <= threshold and in_event:
+                    in_event = False
+                    events.append(InteractionEvent(
+                        clip_id        = track_set.clip_id,
+                        event_type     = "child_conflict_solo",
+                        start_frame    = event_start,
+                        end_frame      = idx,
+                        track_ids      = [track_a.track_id],
+                        score          = max(smoothed[event_start:idx]),
+                        triggered_rules= ["solo_high_accel"],
+                        teacher_present= False,
+                        region         = "unknown",
+                    ))
+            if in_event:
+                events.append(InteractionEvent(
+                    clip_id        = track_set.clip_id,
+                    event_type     = "child_conflict_solo",
+                    start_frame    = event_start,
+                    end_frame      = len(smoothed) - 1,
+                    track_ids      = [track_a.track_id],
+                    score          = max(smoothed[event_start:]),
+                    triggered_rules= ["solo_high_accel"],
+                    teacher_present= False,
+                    region         = "unknown",
+                ))
         return events
+
+
 
     for track_a, track_b in pairs:
         # Step2: 找近身时间窗
