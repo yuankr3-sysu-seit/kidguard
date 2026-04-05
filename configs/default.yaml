@@ -1,19 +1,8 @@
 dataset:
-  ntu_conflict_actions:
-  - 49
-  - 50
-  - 51
-  ntu_normal_actions:
-  - 1
-  - 2
-  - 3
-  - 4
-  - 5
-  - 6
-  - 7
-  - 8
-  - 9
-  - 10
+  ntu_conflict_actions: [49, 50, 51]
+  # 将单人动作改为双人正常互动动作（如拥抱、握手、拍背等）
+  ntu_normal_actions: [52, 53, 54, 55, 56, 57, 58, 59, 60]
+
 output:
   save_events_csv: true
   save_events_json: false

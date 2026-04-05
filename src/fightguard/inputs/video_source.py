@@ -91,6 +91,7 @@ def process_video_to_trackset(
     tracks_dict: Dict[int, SkeletonTrack] = {}
 
     frame_idx = 0
+    
     while cap.isOpened():
         if max_frames is not None and frame_idx >= max_frames:
             break
@@ -98,47 +99,34 @@ def process_video_to_trackset(
         ret, frame = cap.read()
         if not ret:
             break
-        # YOLO 追踪推理：提取骨骼点并保持人员 ID 连贯
-        # persist=True 保持跨帧追踪状态，tracker="botsort.yaml" 使用高精度追踪器
-        results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False, device="cpu")
 
+        # 【恢复】不抽帧，不压缩 imgsz，保证追踪器连续性和关键点精度
+        results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False, device="cpu")
+        
         if len(results) > 0 and results[0].keypoints is not None:
-            # 获取当前帧所有人的关键点数据
-            # kpts.xyn 是已经归一化到 0~1 的坐标！(x, y)
-            # shape: (人数, 17个点, 2个坐标)
-            kpts_xyn = results[0].keypoints.xyn.cpu().numpy()
-            
-                        # 获取追踪 ID（如果追踪失败则为 None）
             track_ids = results[0].boxes.id
             if track_ids is None:
                 frame_idx += 1
                 continue
                 
             track_ids = track_ids.int().cpu().tolist()
+            kpts_xyn = results[0].keypoints.xyn.cpu().numpy()
 
             for person_idx, person_kpts in enumerate(kpts_xyn):
                 if person_idx >= len(track_ids):
                     break
                     
                 track_id = track_ids[person_idx]
-                
-                # 将 YOLO 输出的 17 个点数组转换为我们契约规定的字典
                 keypoints_dict: Keypoints = {}
                 for i, name in enumerate(COCO17_KEYPOINT_NAMES):
                     if i < len(person_kpts):
                         x, y = person_kpts[i]
-                        # YOLO 有时会把置信度低的点输出为 [0, 0]
                         keypoints_dict[name] = [float(x), float(y)]
                     else:
                         keypoints_dict[name] = [0.0, 0.0]
                 
-                # 分配轨迹 ID
-                track_id = person_idx
                 if track_id not in tracks_dict:
-                    tracks_dict[track_id] = SkeletonTrack(
-                        track_id=track_id,
-                        role="child"
-                    )
+                    tracks_dict[track_id] = SkeletonTrack(track_id=track_id, role="child")
                 
                 tracks_dict[track_id].frames.append(frame_idx)
                 tracks_dict[track_id].keypoints.append(keypoints_dict)
@@ -151,13 +139,12 @@ def process_video_to_trackset(
         print(f"[WARNING] 视频中未检测到任何人：{video_path}")
         return None
 
-    # 组装 TrackSet
     track_set = TrackSet(
         clip_id=clip_id,
         label=label,
         tracks=list(tracks_dict.values()),
-        fps=fps,
+        fps=fps,  # 恢复原始 FPS
         total_frames=frame_idx
     )
-    
     return track_set
+    

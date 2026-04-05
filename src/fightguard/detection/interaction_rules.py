@@ -30,6 +30,56 @@ from fightguard.detection.pairing import (
 
 
 # ============================================================
+# 新增：有限状态机 (FSM) 模块
+# 解决 2D 真实场景下瞬间噪点导致的误报问题，以及事件碎片化问题
+# ============================================================
+
+class PairStateMachine:
+    def __init__(self, conflict_threshold: int = 3, cooldown_frames: int = 15):
+        self.state = "NORMAL"  # 初始状态
+        self.conflict_buffer = 0  # 连续超过危险得分的帧数累加器
+        self.cooldown_buffer = 0  # 冷却倒计时
+        
+        self.conflict_threshold = conflict_threshold  # 必须连续 N 帧高分才算真打架
+        self.cooldown_frames = cooldown_frames        # 冲突结束后的冷却维持帧数
+
+    def update(self, is_proximate: bool, score: float, alert_threshold: float) -> str:
+        """
+        根据当前帧的近身状态和危险得分，更新状态机，返回当前状态。
+        """
+        if self.state == "NORMAL":
+            if is_proximate:
+                self.state = "CONTACT"
+                
+        elif self.state == "CONTACT":
+            if not is_proximate:
+                self.state = "NORMAL"
+                self.conflict_buffer = 0
+            elif score > alert_threshold:
+                self.conflict_buffer += 1
+                if self.conflict_buffer >= self.conflict_threshold:
+                    self.state = "CONFLICT"
+                    self.cooldown_buffer = self.cooldown_frames
+            else:
+                self.conflict_buffer = max(0, self.conflict_buffer - 1)
+                
+        elif self.state == "CONFLICT":
+            if score > alert_threshold:
+                # 持续冲突，刷新冷却时间
+                self.cooldown_buffer = self.cooldown_frames
+            else:
+                # 得分掉下去了，进入冷却倒计时
+                self.cooldown_buffer -= 1
+                if self.cooldown_buffer <= 0:
+                    self.state = "NORMAL"
+                    self.conflict_buffer = 0
+
+        return self.state
+
+
+
+
+# ============================================================
 # 第一部分：关键点近似工具
 # ============================================================
 
@@ -184,16 +234,6 @@ def compute_wrist_acceleration(
     dt: float,
     side: str = "right",
 ) -> float:
-    """
-    计算施力方手腕的线加速度 a_A。
-
-    公式：
-      v_A^t = ||K_A,wrist^t - K_A,wrist^(t-1)|| / (S_A * Δt)
-      a_A^t = (v_A^t - v_A^(t-1)) / Δt
-
-    参数：
-        side: "right" 或 "left"，选择哪只手腕
-    """
     wrist_key = f"{side}_wrist"
 
     if frame_idx < 2 or frame_idx >= len(track.keypoints):
@@ -208,17 +248,26 @@ def compute_wrist_acceleration(
     w_t2 = kp_t2.get(wrist_key)
 
     if w_t is None or w_t1 is None or w_t2 is None:
-            return 0.0
+        return 0.0
         
     # 修复 YOLO 视觉丢失导致的 [0.0, 0.0] 瞬移 Bug
     if w_t == [0.0, 0.0] or w_t1 == [0.0, 0.0] or w_t2 == [0.0, 0.0]:
         return 0.0
 
+    # 【成功之刃 1：物理常识过滤器】
+    # 如果手腕在 1 帧内移动超过画面的 15% (归一化距离 0.15)
+    # 这在物理上是不可能的，绝对是 YOLO 发生了肢体错位（Limb Swapping）
+    # 直接忽略这帧的加速度，防止数学爆炸！
+    dist_t = euclidean_distance(w_t, w_t1)
+    dist_t1 = euclidean_distance(w_t1, w_t2)
+    if dist_t > 0.15 or dist_t1 > 0.15:
+        return 0.0
 
-    scale = get_shoulder_scale(kp_t)
+    # 2D 视频已经归一化，强制 scale 为 1.0
+    scale = 1.0 
 
-    v_t  = euclidean_distance(w_t,  w_t1) / (scale * dt)
-    v_t1 = euclidean_distance(w_t1, w_t2) / (scale * dt)
+    v_t  = dist_t / (scale * dt)
+    v_t1 = dist_t1 / (scale * dt)
 
     return abs(v_t - v_t1) / dt
 
@@ -322,15 +371,17 @@ def compute_elbow_angular_acceleration(
     dt: float,
     side: str = "right",
 ) -> float:
-    """
-    计算肘关节角加速度 α_A。
-
-    公式：
-      ω_A^t = (θ_A^t - θ_A^(t-1)) / Δt
-      α_A^t = (ω_A^t - ω_A^(t-1)) / Δt
-    """
     if frame_idx < 2 or frame_idx >= len(track.keypoints):
         return 0.0
+
+    # 【成功之刃 2：防止角加速度爆炸】
+    # 检查手腕是否发生了瞬间瞬移
+    wrist_key = f"{side}_wrist"
+    w_t = track.keypoints[frame_idx].get(wrist_key)
+    w_t1 = track.keypoints[frame_idx - 1].get(wrist_key)
+    if w_t and w_t1 and w_t != [0.0, 0.0] and w_t1 != [0.0, 0.0]:
+        if euclidean_distance(w_t, w_t1) > 0.15:
+            return 0.0  # YOLO 肢体错位，忽略该帧
 
     theta_t  = compute_elbow_angle(track.keypoints[frame_idx],     side)
     theta_t1 = compute_elbow_angle(track.keypoints[frame_idx - 1], side)
@@ -537,167 +588,100 @@ def run_rules_on_clip(
     cfg: Optional[dict] = None,
 ) -> List[InteractionEvent]:
     """
-    对一个 TrackSet（clip）执行完整的规则流，返回检测到的事件列表。
-
-    流程：
-      1. 配对 → 2. 近身窗口检测 → 3. 逐帧评分 → 4. 滑窗平均 → 5. 报警判决
-
-    返回：InteractionEvent 列表（可能为空）
+    使用【状态机】重构的端到端规则流。
+    彻底废弃扁平的滑窗逻辑，利用状态流转抵抗 2D 视频中的瞬间噪点误报。
     """
     from fightguard.detection.pairing import get_interaction_pairs
 
     if cfg is None:
         cfg = get_config()
 
-    rules  = cfg["rules"]
-    tau_dist  = rules["proximity_threshold"]
-    window_w  = rules.get("proximity_window_frames", 5)   # 连续近身帧数
-    window_m  = rules.get("smoothing_window_frames",  5)   # 滑窗平均帧数
-    threshold = rules.get("alert_threshold",           0.3) # 报警阈值
-    dt        = 1.0 / track_set.fps
+    rules = cfg["rules"]
+   
+    # 【逻辑优化】在 2D 视频中彻底解除空间距离封印。
+    # 只要他们是画面里配对成功的两人，就直接计算物理动作特征，由状态机和得分来裁决！
+    tau_dist = 2.0 
+ 
+
+    alert_threshold = rules.get("alert_threshold", 0.20)
+    dt = 1.0 / track_set.fps
 
     events: List[InteractionEvent] = []
-
-    # Step1: 配对
     pairs = get_interaction_pairs(track_set, cfg)
+    
     if not pairs:
-        # 单人clip降级处理：只用施力方自身特征评分
-        # 当clip只有1人时，无法做双人配对，
-        # 改为检测该人自身的爆发性动作（高腕部加速度+高肘部角加速度）
-        if len(track_set.tracks) == 1:
-            track_a = track_set.tracks[0]
-            solo_scores = []
-            for fi in range(len(track_a.keypoints)):
-                if fi < 2:
-                    solo_scores.append(0.0)
-                    continue
-                from fightguard.detection.interaction_rules import (
-                    compute_wrist_acceleration,
-                    compute_elbow_angular_acceleration,
-                    normalize_feature,
-                )
-                dt = 1.0 / track_set.fps
-                a_A     = max(
-                    compute_wrist_acceleration(track_a, fi, dt, "right"),
-                    compute_wrist_acceleration(track_a, fi, dt, "left"),
-                )
-                alpha_A = max(
-                    compute_elbow_angular_acceleration(track_a, fi, dt, "right"),
-                    compute_elbow_angular_acceleration(track_a, fi, dt, "left"),
-                )
-                score = 0.6 * normalize_feature(a_A, 0.0, 50.0) + \
-                        0.4 * normalize_feature(alpha_A, 0.0, 100.0)
-                solo_scores.append(score)
-
-            smoothed  = sliding_window_avg(solo_scores,
-                            cfg["rules"].get("smoothing_window_frames", 5))
-            threshold = cfg["rules"].get("alert_threshold", 0.3)
-            in_event  = False
-            event_start = 0
-            for idx, avg_score in enumerate(smoothed):
-                if avg_score > threshold and not in_event:
-                    in_event    = True
-                    event_start = idx
-                elif avg_score <= threshold and in_event:
-                    in_event = False
-                    events.append(InteractionEvent(
-                        clip_id        = track_set.clip_id,
-                        event_type     = "child_conflict_solo",
-                        start_frame    = event_start,
-                        end_frame      = idx,
-                        track_ids      = [track_a.track_id],
-                        score          = max(smoothed[event_start:idx]),
-                        triggered_rules= ["solo_high_accel"],
-                        teacher_present= False,
-                        region         = "unknown",
-                    ))
-            if in_event:
-                events.append(InteractionEvent(
-                    clip_id        = track_set.clip_id,
-                    event_type     = "child_conflict_solo",
-                    start_frame    = event_start,
-                    end_frame      = len(smoothed) - 1,
-                    track_ids      = [track_a.track_id],
-                    score          = max(smoothed[event_start:]),
-                    triggered_rules= ["solo_high_accel"],
-                    teacher_present= False,
-                    region         = "unknown",
-                ))
-        return events
-
-
+        return events # 暂略单人降级，专注双人状态机
 
     for track_a, track_b in pairs:
-        # Step2: 找近身时间窗
-        prox_windows = find_proximity_windows(track_a, track_b, tau_dist, window_w)
-        if not prox_windows:
-            continue
+        n_frames = min(len(track_a.keypoints), len(track_b.keypoints))
+        
+        # 预计算所有帧的肩距尺度和近身状态
+        scales_a = [get_shoulder_scale(kp) for kp in track_a.keypoints[:n_frames]]
+        scales_b = [get_shoulder_scale(kp) for kp in track_b.keypoints[:n_frames]]
+        
+        # 初始化状态机 (连续 1 帧高分触发，30 帧冷却防碎片化)
+        fsm = PairStateMachine(conflict_threshold=1, cooldown_frames=30)
+        
+        in_event = False
+        event_start = 0
+        event_max_score = 0.0
+        triggered_rules_set = set()
 
-        for win_start, win_end in prox_windows:
-            # Step3: 逐帧计算得分（在近身窗口内）
-            frame_scores = []
-            frame_details = []
-            for fi in range(win_start, win_end + 1):
-                score, details = compute_frame_score(track_a, track_b, fi, cfg, dt)
-                frame_scores.append(score)
-                frame_details.append(details)
-
-            # Step4: 滑窗平均
-            smoothed = sliding_window_avg(frame_scores, window_m)
-
-            # Step5: 报警判决 — 找连续超阈值的片段
-            in_event   = False
-            event_start = 0
-            triggered_rules = []
-
-            for idx, avg_score in enumerate(smoothed):
-                abs_frame = win_start + idx
-                if avg_score > threshold and not in_event:
-                    in_event    = True
-                    event_start = abs_frame
-                    triggered_rules = []
-                elif avg_score > threshold and in_event:
-                    # 收集触发的规则描述
-                    d = frame_details[idx]
-                    if d["r_aA"] > 0.3:
-                        triggered_rules.append("high_wrist_accel")
-                    if d["r_vrel"] > 0.3:
-                        triggered_rules.append("high_approach_speed")
-                    if d["r_alphaA"] > 0.3:
-                        triggered_rules.append("high_elbow_angular_accel")
-                    if d["r_dphi"] > 0.3:
-                        triggered_rules.append("torso_tilt_change")
-                elif avg_score <= threshold and in_event:
-                    in_event = False
-                    # 生成事件
-                    event = InteractionEvent(
-                        clip_id        = track_set.clip_id,
-                        event_type     = "child_conflict",
-                        start_frame    = event_start,
-                        end_frame      = abs_frame,
-                        track_ids      = [track_a.track_id, track_b.track_id],
-                        score          = max(smoothed[event_start - win_start:idx]),
-                        triggered_rules= list(set(triggered_rules)),
-                        teacher_present= False,
-                        region         = "unknown",
-                    )
-                    events.append(event)
-
+        for fi in range(n_frames):
+            # 1. 判断是否近身 (2D 环境下放宽)
+            is_prox, _ = check_proximity_condition(track_a, track_b, fi, tau_dist, scales_a[fi], scales_b[fi])
             
-            # 处理窗口末尾仍在事件中的情况
-            if in_event:
-                event = InteractionEvent(
-                    clip_id         = track_set.clip_id,
-                    event_type      = "child_conflict",
-                    start_frame     = event_start,
-                    end_frame       = win_end,
-                    track_ids       = [track_a.track_id, track_b.track_id],
-                    score           = max(smoothed[event_start - win_start:]),
-                    triggered_rules = list(set(triggered_rules)),
-                    teacher_present = False,
-                    region          = "unknown",
-                )
-                events.append(event)
+            # 2. 计算本帧得分
+            score = 0.0
+            details = {}
+            if is_prox:
+                score, details = compute_frame_score(track_a, track_b, fi, cfg, dt)
+            
+            # 3. 状态机流转
+            current_state = fsm.update(is_prox, score, alert_threshold)
+            
+            # 4. 根据状态机生成事件
+            if current_state == "CONFLICT" and not in_event:
+                in_event = True
+                event_start = fi
+                event_max_score = score
+                triggered_rules_set.clear()
+                
+            elif current_state == "CONFLICT" and in_event:
+                event_max_score = max(event_max_score, score)
+                # 收集触发的规则
+                if details.get("r_aA", 0) > 0.3: triggered_rules_set.add("high_wrist_accel")
+                if details.get("r_alphaA", 0) > 0.3: triggered_rules_set.add("high_elbow_angular_accel")
+                if details.get("r_dphi", 0) > 0.3: triggered_rules_set.add("torso_tilt_change")
+                
+            elif current_state == "NORMAL" and in_event:
+                # 冲突结束（冷却期已过）
+                in_event = False
+                events.append(InteractionEvent(
+                    clip_id=track_set.clip_id,
+                    event_type="child_conflict",
+                    start_frame=event_start,
+                    end_frame=fi - fsm.cooldown_frames, # 剔除冷却期的空转帧
+                    track_ids=[track_a.track_id, track_b.track_id],
+                    score=round(event_max_score, 3),
+                    triggered_rules=list(triggered_rules_set),
+                    teacher_present=False,
+                    region="unknown"
+                ))
+
+        # 处理视频结束时仍在冲突中的情况
+        if in_event:
+            events.append(InteractionEvent(
+                clip_id=track_set.clip_id,
+                event_type="child_conflict",
+                start_frame=event_start,
+                end_frame=n_frames - 1,
+                track_ids=[track_a.track_id, track_b.track_id],
+                score=round(event_max_score, 3),
+                triggered_rules=list(triggered_rules_set),
+                teacher_present=False,
+                region="unknown"
+            ))
 
     return events
 
