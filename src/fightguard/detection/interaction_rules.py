@@ -54,8 +54,16 @@ def get_pelvis_approx(kp: dict) -> Optional[List[float]]:
         return None
     return [(lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0]
 
-
 def get_shoulder_scale(kp: dict) -> float:
+    """
+    计算肩距作为个体尺度基准 S_i。
+    【阶段二重大修复】：由于 2D 视频坐标已经归一化到 [0, 1]，
+    如果再除以极小的肩宽（如 0.05），会导致距离和加速度发生 20 倍以上的数学爆炸！
+    因此在 2D 归一化坐标系下，强制返回 1.0，废除肩宽缩放。
+    """
+    return 1.0
+
+#def get_shoulder_scale(kp: dict) -> float:
     """
     计算肩距作为个体尺度基准 S_i。
     公式：S_i = ||K_i,L_Shoulder - K_i,R_Shoulder||
@@ -200,7 +208,12 @@ def compute_wrist_acceleration(
     w_t2 = kp_t2.get(wrist_key)
 
     if w_t is None or w_t1 is None or w_t2 is None:
+            return 0.0
+        
+    # 修复 YOLO 视觉丢失导致的 [0.0, 0.0] 瞬移 Bug
+    if w_t == [0.0, 0.0] or w_t1 == [0.0, 0.0] or w_t2 == [0.0, 0.0]:
         return 0.0
+
 
     scale = get_shoulder_scale(kp_t)
 
@@ -232,7 +245,12 @@ def compute_attack_distance(
     head  = kp_b.get("nose")  # COCO-17用nose近似head
 
     if wrist is None or head is None:
+            return float("inf")
+        
+    # 修复 YOLO 视觉丢失 Bug
+    if wrist == [0.0, 0.0] or head == [0.0, 0.0]:
         return float("inf")
+
 
     raw_dist  = euclidean_distance(wrist, head)
     avg_scale = (get_shoulder_scale(kp_a) + get_shoulder_scale(kp_b)) / 2.0
@@ -441,8 +459,13 @@ def compute_frame_score(
     r_alphaA    = normalize_feature(alpha_A,      0.0, 100.0)
     r_deltaPhiB = normalize_feature(delta_phi_B,  0.0, 1.0)
 
-    # ── 权重（可后续移入 default.yaml 调参）──
-    w1, w2, w3, w4 = 0.35, 0.30, 0.20, 0.15
+    # ── 权重（基于 451 个样本的熵权法客观赋权）──
+    # w1: 腕部线加速度 (0.4926)  - 区分度最高，体现爆发力
+    # w2: 相对接近速度 (0.2130)
+    # w3: 肘部角加速度 (0.1218)
+    # w4: 躯干倾角变化 (0.1726)
+    w1, w2, w3, w4 = 0.4926, 0.2130, 0.1218, 0.1726
+
 
     # ── 基础得分 ──
     score_base = w1 * r_aA + w2 * r_vrel + w3 * r_alphaA + w4 * r_deltaPhiB
