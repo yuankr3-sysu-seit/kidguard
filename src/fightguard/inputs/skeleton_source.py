@@ -156,7 +156,47 @@ def _parse_one_body(lines: List[str], start_idx: int) -> Tuple[Keypoints, int]:
         else:
             keypoints[coco_name] = [0.0, 0.0]  # 缺失点用零填充
 
+    # 归一化到 [0, 1]，统一坐标体系
+    keypoints = _normalize_keypoints(keypoints)
+
     return keypoints, idx
+
+
+def _normalize_keypoints(keypoints: Keypoints) -> Keypoints:
+    """
+    对单帧关键点坐标做 min-max 归一化，将世界坐标（米制）压缩到 [0, 1]。
+    
+    NTU 原始坐标是3D世界坐标（单位：米），直接用于距离计算会与
+    归一化坐标体系的阈值不兼容。归一化后所有模块统一使用 [0,1] 坐标。
+    
+    归一化方式：
+        x_norm = (x - x_min) / (x_max - x_min)
+        y_norm = (y - y_min) / (y_max - y_min)
+    
+    如果所有点坐标相同（分母为0），保持原值不变。
+    """
+    xs = [v[0] for v in keypoints.values() if v != [0.0, 0.0]]
+    ys = [v[1] for v in keypoints.values() if v != [0.0, 0.0]]
+
+    if not xs or not ys:
+        return keypoints  # 全为零点，无法归一化，原样返回
+
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    x_range = x_max - x_min if x_max != x_min else 1.0
+    y_range = y_max - y_min if y_max != y_min else 1.0
+
+    normalized: Keypoints = {}
+    for name, coords in keypoints.items():
+        if coords == [0.0, 0.0]:
+            normalized[name] = [0.0, 0.0]  # 缺失点保持零
+        else:
+            normalized[name] = [
+                (coords[0] - x_min) / x_range,
+                (coords[1] - y_min) / y_range,
+            ]
+    return normalized
 
 
 # ============================================================
