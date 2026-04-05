@@ -1,46 +1,71 @@
-import sys
+import sys, os, csv
 sys.path.insert(0, "src")
 
 from fightguard.inputs.skeleton_source import load_dataset
-from fightguard.detection.pairing import (
-    get_interaction_pairs,
-    get_proximity_frames,
-    compute_pair_distance_at_frame,
-)
+from fightguard.detection.interaction_rules import run_rules_symmetric
 from fightguard.config import get_config
 
-cfg = get_config()
-data_dirs = ["D:/dataset_1/nturgbd_skeletons_s001_to_s017"]
-tracks = load_dataset(data_dirs, max_clips=20)
+cfg      = get_config()
+data_dirs = [
+    "D:/dataset_1/nturgbd_skeletons_s001_to_s017",
+    "D:/dataset_1/nturgbd_skeletons_s018_to_s032",
+]
 
-# 找第一个有2人的冲突clip
-target = None
-for t in tracks:
-    if len(t.tracks) >= 2 and t.label == 1:
-        target = t
-        break
+# 加载500个clip做更可靠的评估
+track_sets = load_dataset(data_dirs, max_clips=500)
 
-if target:
-    a, b = target.tracks[0], target.tracks[1]
-    print(f"Clip: {target.clip_id}, 总帧数: {target.total_frames}")
+tp = fp = tn = fn = 0
+rows = []  # 用于写CSV
 
-    # 验证归一化后的坐标范围
-    kp = a.keypoints[0]
-    print(f"归一化后左手腕: {kp['left_wrist']}")
-    print(f"归一化后右肩:   {kp['right_shoulder']}")
+for ts in track_sets:
+    events    = run_rules_symmetric(ts, cfg)
+    predicted = 1 if events else 0
+    actual    = ts.label
+    top_score = round(max((e.score for e in events), default=0.0), 4)
+    top_rules = str(events[0].triggered_rules) if events else "[]"
 
-    # 验证距离范围
-    dists = []
-    for i in range(min(len(a.keypoints), len(b.keypoints))):
-        d = compute_pair_distance_at_frame(a, b, i)
-        if d is not None:
-            dists.append(d)
-    print(f"归一化后距离 — 最小: {min(dists):.4f}, 最大: {max(dists):.4f}, 均值: {sum(dists)/len(dists):.4f}")
+    if actual == 1 and predicted == 1: tp += 1
+    elif actual == 0 and predicted == 1: fp += 1
+    elif actual == 0 and predicted == 0: tn += 1
+    elif actual == 1 and predicted == 0: fn += 1
 
-    # 验证近身帧
-    pairs = get_interaction_pairs(target, cfg)
-    if pairs:
-        a2, b2 = pairs[0]
-        prox = get_proximity_frames(a2, b2, cfg["rules"]["proximity_threshold"])
-        print(f"近身帧数量（阈值={cfg['rules']['proximity_threshold']}）: {len(prox)} / {target.total_frames}")
-        print(f"近身帧索引（前10个）: {prox[:10]}")
+    rows.append({
+        "clip_id":   ts.clip_id,
+        "actual":    actual,
+        "predicted": predicted,
+        "result":    "TP" if actual==1 and predicted==1 else
+                     "FP" if actual==0 and predicted==1 else
+                     "TN" if actual==0 and predicted==0 else "FN",
+        "top_score": top_score,
+        "rules":     top_rules,
+    })
+
+# ── 写入CSV ──────────────────────────────────────────────────
+os.makedirs("outputs/metrics", exist_ok=True)
+csv_path = "outputs/metrics/eval_results.csv"
+with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+
+# ── 输出最终指标 ──────────────────────────────────────────────
+total     = tp + fp + tn + fn
+recall    = tp / (tp + fn)    if (tp + fn) > 0 else 0.0
+precision = tp / (tp + fp)    if (tp + fp) > 0 else 1.0
+fpr       = fp / (tn + fp)    if (tn + fp) > 0 else 0.0
+acc       = (tp + tn) / total if total > 0       else 0.0
+f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+print(f"{'='*55}")
+print(f"  KidGuard 基础版规则流 — 正式评测报告")
+print(f"  数据集：NTU RGBD s001~s032  样本数：{total}")
+print(f"  冲突样本：{tp+fn}   正常样本：{tn+fp}")
+print(f"{'='*55}")
+print(f"  TP={tp}  FP={fp}  TN={tn}  FN={fn}")
+print(f"  Accuracy  (准确率) : {acc:.4f}")
+print(f"  Precision (精确率) : {precision:.4f}")
+print(f"  Recall    (召回率) : {recall:.4f}")
+print(f"  F1 Score           : {f1:.4f}")
+print(f"  FPR       (误报率) : {fpr:.4f}")
+print(f"{'='*55}")
+print(f"  结果已保存至：{csv_path}")
