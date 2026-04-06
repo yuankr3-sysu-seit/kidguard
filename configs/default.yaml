@@ -27,6 +27,11 @@ rules:
   # ByteTrack 追踪器配置（在 video_source.py 中使用）
   tracker: "bytetrack.yaml"
   tracker_conf: 0.2
+  # 【防线 1：反瞬移过滤】归一化特征的物理上限（0.95 表示一帧内移动了约 3 倍肩宽）
+  tau_teleport: 15.0
+  # 【防线 2：事件确认时间窗】在过去 confirm_window 帧内，至少 min_confirm_frames 帧满足作用-响应条件
+  confirm_window: 4
+  min_confirm_frames: 3
 skeleton:
   keypoint_names:
   - nose

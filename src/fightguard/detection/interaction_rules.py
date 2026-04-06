@@ -256,7 +256,7 @@ def compute_confidence_suppression(
 # ============================================================
 
 class CaptainStateMachine:
-    """基于队长公式的四段式状态机"""
+    """基于队长公式的四段式状态机（含反瞬移过滤与时间窗确认）"""
     
     def __init__(self, cfg: dict):
         rules = cfg.get("rules", {})
@@ -272,17 +272,55 @@ class CaptainStateMachine:
         self.alert_threshold = rules.get("alert_threshold", 0.3136)
         self.M = rules.get("M", 5)
         
+        # 【防线 1：反瞬移阈值】归一化特征的物理上限
+        # 人类不可能在一帧内移动超过 3 倍肩宽（r_a 或 r_v 接近 1.0）
+        self.tau_teleport = rules.get("tau_teleport", 0.95)
+        
+        # 【防线 2：事件确认时间窗】
+        # 在过去 confirm_window 帧内，至少有 min_confirm_frames 帧满足作用-响应条件
+        self.confirm_window = rules.get("confirm_window", 5)
+        self.min_confirm_frames = rules.get("min_confirm_frames", 3)
+        
         # 状态机状态
         self.state = 0  # 0: 初始状态, 1: 接近阶段, 2: 动作激活阶段, 3: 作用-响应阶段
         self.prox_buffer = 0
         self.sep_buffer = 0
         self.score_buffer = []
         self.in_event = False
+        
+        # 【防线 2 专用】作用-响应阶段的时间窗计数
+        self.response_history = []  # 记录最近 confirm_window 帧是否满足作用-响应条件
     
     def update(self, dist: float, details_ab: dict, details_ba: dict, score_pair: float) -> Tuple[bool, float]:
         """状态机更新
         严格实现同步因果律，基于当前帧的瞬间同步物理量
+        含反瞬移过滤与时间窗确认两道终极防线
         """
+        # ========================================
+        # 【防线 1：反瞬移过滤】
+        # 检测 YOLO 关键点闪烁导致的非人类物理量
+        # ========================================
+        is_teleport_ab = (
+            details_ab.get("r_a", 0) > self.tau_teleport or
+            details_ab.get("r_v", 0) > self.tau_teleport
+        )
+        is_teleport_ba = (
+            details_ba.get("r_a", 0) > self.tau_teleport or
+            details_ba.get("r_v", 0) > self.tau_teleport
+        )
+        
+        # 如果检测到瞬移，强制将该方向得分归零并阻断状态机升级
+        if is_teleport_ab:
+            details_ab["r_a"] = 0.0
+            details_ab["r_v"] = 0.0
+        if is_teleport_ba:
+            details_ba["r_a"] = 0.0
+            details_ba["r_v"] = 0.0
+        
+        # 如果双向都是瞬移，直接清零当前帧得分
+        if is_teleport_ab and is_teleport_ba:
+            score_pair = 0.0
+
         # 0. 分离重置逻辑
         if dist > self.tau_dist:
             self.sep_buffer += 1
@@ -293,6 +331,7 @@ class CaptainStateMachine:
             self.state = 0
             self.prox_buffer = 0
             self.score_buffer.clear()
+            self.response_history.clear()
             self.in_event = False
             return False, 0.0
 
@@ -339,8 +378,22 @@ class CaptainStateMachine:
                 (details_ba.get("r_phi", 0) > self.tau_phi or details_ba.get("r_p", 0) > self.tau_p)
             )
             
-            if response_ab or response_ba:
-                self.state = 3  # 物理链条闭环
+            current_response = response_ab or response_ba
+            
+            # 【防线 2：时间窗连续性确认】
+            # 记录最近 confirm_window 帧的作用-响应状态
+            self.response_history.append(1 if current_response else 0)
+            if len(self.response_history) > self.confirm_window:
+                self.response_history.pop(0)
+            
+            # 只有当过去 confirm_window 帧内至少有 min_confirm_frames 帧满足条件时，才允许进入状态 3
+            response_count = sum(self.response_history)
+            
+            if current_response and response_count >= self.min_confirm_frames:
+                self.state = 3  # 物理链条闭环 + 时间窗确认通过
+            elif not current_response:
+                # 如果当前帧不满足作用-响应，允许状态保持但不升级
+                pass
 
         # (4) 事件确认阶段
         self.score_buffer.append(score_pair)
