@@ -147,26 +147,26 @@ def _parse_one_body(lines: List[str], start_idx: int) -> Tuple[Keypoints, int]:
 
     # 按映射表构建 COCO-17 字典
     # 注意：NTU 坐标是3D世界坐标（单位：米），不是归一化的
-    # 这里先保留原始值，归一化在 pairing.py 中按需处理
+    # 这里先保留原始值，归一化在后面做
     keypoints: Keypoints = {}
     for coco_name, ntu_idx in NTU_TO_COCO17.items():
         if ntu_idx < num_joints:
-            # NTU 数据格式：每个点 11 个值，前三个是 x, y, z
-            x = float(joint_data[ntu_idx * 11 + 0])
-            y = float(joint_data[ntu_idx * 11 + 1])
+            # 使用 raw_joints 中已读取的坐标
+            x, y = raw_joints[ntu_idx]
             
             if x == 0.0 and y == 0.0:
-                coco17_dict[coco_name] = [0.0, 0.0, 0.0]
+                keypoints[coco_name] = [0.0, 0.0, 0.0]
             else:
                 # NTU 是高精度 3D 摄录数据，有效点的置信度默认给满 1.0
-                coco17_dict[coco_name] = [x, y, 1.0]
+                keypoints[coco_name] = [x, y, 1.0]
         else:
-            coco17_dict[coco_name] = [0.0, 0.0, 0.0]
+            keypoints[coco_name] = [0.0, 0.0, 0.0]
     
-    
-    
-    # 归一化到 [0, 1]，统一坐标体系
-    keypoints = _normalize_keypoints(keypoints)
+    # 【核心修复：废除帧内 min-max 归一化】
+    # NTU 数据是 3D 世界坐标（米制），具有真实的物理尺度。
+    # 帧内 min-max 归一化会破坏绝对尺度，导致肩宽、速度、加速度等物理特征失真。
+    # 直接传递原始坐标，让规则引擎的肩宽归一化（shoulder_scale）来处理尺度统一。
+    # keypoints = _normalize_keypoints(keypoints)  # ← 已禁用
 
     return keypoints, idx
 
@@ -262,6 +262,24 @@ def load_skeleton_file(filepath: str, cfg: Optional[dict] = None) -> Optional[Tr
                 )
             tracks_dict[track_id].frames.append(frame_no)
             tracks_dict[track_id].keypoints.append(keypoints)
+
+    # 【实战优化：时空绝对对齐】
+    # NTU 数据中，不同人员可能在不同帧出现/消失。必须将所有轨迹用空数据填充到相同的总帧数，
+    # 保证 track.keypoints[i] 永远严格对应物理第 i 帧！
+    from fightguard.contracts import COCO17_KEYPOINT_NAMES
+    empty_kp = {name: [0.0, 0.0, 0.0] for name in COCO17_KEYPOINT_NAMES}
+    
+    for track in tracks_dict.values():
+        aligned_kpts = []
+        for i in range(total_frames):
+            if i in track.frames:
+                idx = track.frames.index(i)
+                aligned_kpts.append(track.keypoints[idx])
+            else:
+                # 该帧此人不存在，填充空数据
+                aligned_kpts.append(empty_kp)
+        track.keypoints = aligned_kpts
+        track.frames = list(range(total_frames))  # 重写 frames 列表
 
     # 构建 TrackSet
     track_set = TrackSet(

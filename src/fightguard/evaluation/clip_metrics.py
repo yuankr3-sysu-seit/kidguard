@@ -32,6 +32,7 @@ def calculate_metrics(results: List[Dict]) -> Dict[str, float]:
     recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
     fpr       = fp / (tn + fp) if (tn + fp) > 0 else 0.0
+    fnr       = fn / (tp + fn) if (tp + fn) > 0 else 0.0  # 漏报率
     acc       = (tp + tn) / total
     f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
@@ -42,5 +43,6 @@ def calculate_metrics(results: List[Dict]) -> Dict[str, float]:
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "fpr": round(fpr, 4),
+        "fnr": round(fnr, 4),  # 新增：漏报率
         "f1_score": round(f1, 4)
     }
