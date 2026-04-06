@@ -1,7 +1,7 @@
 import itertools
 from typing import List, Tuple
 from fightguard.contracts import TrackSet, SkeletonTrack
-from fightguard.detection.interaction_rules import get_body_center_formula, euclidean_distance
+from fightguard.detection.math_utils import get_body_center_formula, euclidean_distance
 
 def compute_pair_distance_at_frame(track_a: SkeletonTrack, track_b: SkeletonTrack, frame_idx: int) -> float:
     if frame_idx >= len(track_a.keypoints) or frame_idx >= len(track_b.keypoints):
