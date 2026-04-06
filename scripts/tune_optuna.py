@@ -63,12 +63,23 @@ def run_tuning(num_samples: int = 15):
         test_cfg = get_config()
         rules = test_cfg["rules"]
         
-        # 搜索：动作激活阈值
-        rules["tau_a"] = trial.suggest_float("tau_a", 0.1, 0.6)
-        rules["tau_v"] = trial.suggest_float("tau_v", 0.1, 0.6)
-        rules["tau_phi"] = trial.suggest_float("tau_phi", 0.1, 0.5)
+        # 【2D 场景搜索空间重构】
+        # 置信度抑制阈值：YOLO 的置信度分布与 NTU 不同
+        rules["tau_c"] = trial.suggest_float("tau_c", 0.3, 0.8)
         
-        # 搜索：状态机时序参数
+        # 肢体加速度阈值：已除以肩宽归一化，2D 像素空间值较小
+        rules["tau_a"] = trial.suggest_float("tau_a", 0.1, 2.0)
+        
+        # 相对接近速度阈值：已归一化，2D 像素空间值较小
+        rules["tau_v"] = trial.suggest_float("tau_v", 0.1, 2.0)
+        
+        # 躯干倾角阈值：角度制，2D 像素空间变化范围
+        rules["tau_phi"] = trial.suggest_float("tau_phi", 5.0, 45.0)
+        
+        # 骨盆速度阈值：已归一化
+        rules["tau_p"] = trial.suggest_float("tau_p", 0.1, 2.0)
+        
+        # 状态机时序参数
         rules["memory_window"] = trial.suggest_int("memory_window", 5, 30)
         rules["M"] = trial.suggest_int("M", 3, 12)
         rules["alert_threshold"] = trial.suggest_float("alert_threshold", 0.10, 0.40)

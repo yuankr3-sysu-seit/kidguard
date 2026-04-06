@@ -112,8 +112,10 @@ def process_video_to_trackset(
         if not ret:
             break
 
-        # 【恢复】不抽帧，不压缩 imgsz，保证追踪器连续性和关键点精度
-        results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False)
+        # 【核心优化：切换为 ByteTrack 追踪器】
+        # ByteTrack 对低分检测框更鲁棒，适合两人重叠打斗场景
+        # conf=0.2 降低检测阈值，让 ByteTrack 发挥关联低分框的优势
+        results = model.track(frame, persist=True, tracker="bytetrack.yaml", conf=0.2, verbose=False)
         
         if len(results) > 0 and results[0].keypoints is not None:
             track_ids = results[0].boxes.id

@@ -394,8 +394,9 @@ def compute_directional_score(
     # 使用等权重作为默认配置
     score_base = (r_a + r_v + r_alpha + r_phi + r_p) / 5.0
     
-    # 5. 置信度抑制系数
-    gamma_t = compute_confidence_suppression(track_a, track_b, frame_idx, tau_c=0.5)
+    # 5. 置信度抑制系数（从配置读取 tau_c，支持 Optuna 调参）
+    tau_c = cfg.get("rules", {}).get("tau_c", 0.5)
+    gamma_t = compute_confidence_suppression(track_a, track_b, frame_idx, tau_c=tau_c)
     
     # 6. 最终单向得分
     score_final = gamma_t * score_base

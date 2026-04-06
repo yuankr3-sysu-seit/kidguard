@@ -22,6 +22,11 @@ rules:
   teacher_presence_threshold: 0.5
   velocity_threshold: 0.05
   wrist_intrusion_threshold: 0.15
+  # 置信度抑制阈值（支持 Optuna 调参）
+  tau_c: 0.5
+  # ByteTrack 追踪器配置（在 video_source.py 中使用）
+  tracker: "bytetrack.yaml"
+  tracker_conf: 0.2
 skeleton:
   keypoint_names:
   - nose
