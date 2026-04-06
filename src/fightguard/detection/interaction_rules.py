@@ -272,17 +272,19 @@ class CaptainStateMachine:
     基于队长公式的实战优化版。
     核心改进：引入“异步记忆缓存”，解决真实物理世界中“施力”与“受力”的时间差问题。
     """
+    
     def __init__(self, cfg: dict):
         rules = cfg.get("rules", {})
-        self.tau_dist = 2.0       
-        self.W = 2                
-        self.R = 15               
-        self.tau_v = 0.3          
-        self.tau_a = 0.3          
-        self.tau_alpha = 0.3      
-        self.tau_phi = 0.2        
-        self.alert_threshold = rules.get("alert_threshold", 0.20)
-        self.M = 5                
+        # 【实战优化】：将所有硬编码阈值暴露给 rules 字典，供 Optuna 动态调参
+        self.tau_dist = rules.get("tau_dist", 2.0)       
+        self.W = rules.get("W", 2)                
+        self.R = rules.get("R", 15)               
+        self.tau_v = rules.get("tau_v", 0.31)          
+        self.tau_a = rules.get("tau_a", 0.40)          
+        self.tau_alpha = rules.get("tau_alpha", 0.3)      
+        self.tau_phi = rules.get("tau_phi", 0.11)        
+        self.alert_threshold = rules.get("alert_threshold", 0.24)
+        self.M = rules.get("M", 10)                
         
         self.state = 0            
         self.prox_buffer = 0      
@@ -290,11 +292,11 @@ class CaptainStateMachine:
         self.score_buffer = []    
         self.in_event = False     
         
-        # 【实战优化：异步记忆缓存】
-        # 记录某一方发起攻击后，有效等待对方响应的帧数
         self.action_memory_ab = 0 
         self.action_memory_ba = 0 
-        self.memory_window = 15   # 允许 15 帧 (0.5秒) 的物理延迟
+        self.memory_window = rules.get("memory_window", 19) # 暴露异步记忆窗口
+
+    
 
     def update(self, dist: float, details_ab: dict, details_ba: dict, score_pair: float) -> Tuple[bool, float]:
         # 0. 异步记忆衰减
