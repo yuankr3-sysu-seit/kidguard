@@ -1,764 +1,468 @@
 """
-interaction_rules.py — 交互规则与评分模块
-==========================================
-严格按照队长《建模公式.pdf》实现基础版规则流。
-
-规则流程：
-  1. 触发先决条件：连续W帧内两人距离 < τ_dist
-  2. 动作特征提取：腕部加速度、相对接近速度、肘部角加速度、躯干倾角变化
-  3. 特征归一化 → 加权评分 → 惩罚因子 → 滑窗平均 → 报警判决
-
-关键点近似说明（记录在技术文档）：
-  - Neck  → 用 nose 近似（COCO-17无颈部点）
-  - Pelvis→ 用 (left_hip + right_hip) / 2 近似
+interaction_rules.py — 交互规则与状态机模块 (进阶版)
+======================================================
+严格落实队长《建模公式（引入状态机和角色交互版本）》。
+核心升级：
+1. 置信度抑制 (Confidence Suppression)：解决 YOLO 遮挡噪点
+2. 综合末端特征：涵盖上肢(手腕)与下肢(脚踝)的攻击
+3. 双向角色评分：不预设施力方，计算 A->B 和 B->A
+4. 四段式状态机：接近 -> 动作激活 -> 作用响应 -> 确认
 """
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
-from fightguard.contracts import (
-    InteractionEvent,
-    SkeletonTrack,
-    TrackSet,
-)
+from fightguard.contracts import InteractionEvent, SkeletonTrack, TrackSet
 from fightguard.config import get_config
-from fightguard.detection.pairing import (
-    euclidean_distance,
-    get_proximity_frames,
-    get_torso_center,
-)
-
 
 # ============================================================
-# 新增：有限状态机 (FSM) 模块
-# 解决 2D 真实场景下瞬间噪点导致的误报问题，以及事件碎片化问题
+# 第一部分：基础几何与近似工具 (适配 [x, y, conf])
 # ============================================================
 
-class PairStateMachine:
-    def __init__(self, conflict_threshold: int = 3, cooldown_frames: int = 15):
-        self.state = "NORMAL"  # 初始状态
-        self.conflict_buffer = 0  # 连续超过危险得分的帧数累加器
-        self.cooldown_buffer = 0  # 冷却倒计时
-        
-        self.conflict_threshold = conflict_threshold  # 必须连续 N 帧高分才算真打架
-        self.cooldown_frames = cooldown_frames        # 冲突结束后的冷却维持帧数
+def euclidean_distance(p1: List[float], p2: List[float]) -> float:
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
-    def update(self, is_proximate: bool, score: float, alert_threshold: float) -> str:
-        """
-        根据当前帧的近身状态和危险得分，更新状态机，返回当前状态。
-        """
-        if self.state == "NORMAL":
-            if is_proximate:
-                self.state = "CONTACT"
-                
-        elif self.state == "CONTACT":
-            if not is_proximate:
-                self.state = "NORMAL"
-                self.conflict_buffer = 0
-            elif score > alert_threshold:
-                self.conflict_buffer += 1
-                if self.conflict_buffer >= self.conflict_threshold:
-                    self.state = "CONFLICT"
-                    self.cooldown_buffer = self.cooldown_frames
-            else:
-                self.conflict_buffer = max(0, self.conflict_buffer - 1)
-                
-        elif self.state == "CONFLICT":
-            if score > alert_threshold:
-                # 持续冲突，刷新冷却时间
-                self.cooldown_buffer = self.cooldown_frames
-            else:
-                # 得分掉下去了，进入冷却倒计时
-                self.cooldown_buffer -= 1
-                if self.cooldown_buffer <= 0:
-                    self.state = "NORMAL"
-                    self.conflict_buffer = 0
+def get_neck_approx(kp: dict) -> List[float]:
+    return kp.get("nose", [0.0, 0.0, 0.0])
 
-        return self.state
-
-
-
-
-# ============================================================
-# 第一部分：关键点近似工具
-# ============================================================
-
-def get_neck_approx(kp: dict) -> Optional[List[float]]:
-    """
-    获取颈部近似坐标。
-    COCO-17 无颈部点，用 nose 近似。
-    """
-    return kp.get("nose")
-
-
-def get_pelvis_approx(kp: dict) -> Optional[List[float]]:
-    """
-    获取骨盆近似坐标。
-    COCO-17 无骨盆点，用左右髋关节中点近似。
-    """
-    lh = kp.get("left_hip")
-    rh = kp.get("right_hip")
-    if lh is None or rh is None:
-        return None
-    if lh == [0.0, 0.0] and rh == [0.0, 0.0]:
-        return None
-    return [(lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0]
+def get_pelvis_approx(kp: dict) -> List[float]:
+    lh = kp.get("left_hip", [0.0, 0.0, 0.0])
+    rh = kp.get("right_hip", [0.0, 0.0, 0.0])
+    if lh[:2] == [0.0, 0.0] and rh[:2] == [0.0, 0.0]:
+        return [0.0, 0.0, 0.0]
+    return [(lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0, (lh[2] + rh[2]) / 2.0]
 
 def get_shoulder_scale(kp: dict) -> float:
-    """
-    计算肩距作为个体尺度基准 S_i。
-    【阶段二重大修复】：由于 2D 视频坐标已经归一化到 [0, 1]，
-    如果再除以极小的肩宽（如 0.05），会导致距离和加速度发生 20 倍以上的数学爆炸！
-    因此在 2D 归一化坐标系下，强制返回 1.0，废除肩宽缩放。
-    """
+    # 2D 视频中彻底废除肩宽缩放，避免透视畸变导致数学爆炸
     return 1.0
 
-#def get_shoulder_scale(kp: dict) -> float:
-    """
-    计算肩距作为个体尺度基准 S_i。
-    公式：S_i = ||K_i,L_Shoulder - K_i,R_Shoulder||
-    用于归一化距离，消除拍摄距离差异。
-    若肩距为零（数据缺失），返回1.0避免除零。
-    """
-    ls = kp.get("left_shoulder")
-    rs = kp.get("right_shoulder")
-    if ls is None or rs is None:
-        return 1.0
-    dist = euclidean_distance(ls, rs)
-    return dist if dist > 1e-6 else 1.0
-
-
 def get_body_center_formula(kp: dict) -> Optional[List[float]]:
-    """
-    按公式计算人体中心点：颈部与骨盆的中点。
-    公式：C_i = (K_i,Neck + K_i,Pelvis) / 2
-    """
-    neck   = get_neck_approx(kp)
+    neck = get_neck_approx(kp)
     pelvis = get_pelvis_approx(kp)
-    if neck is None or pelvis is None:
-        return get_torso_center(kp)  # 降级到髋关节中点
+    if neck[:2] == [0.0, 0.0] or pelvis[:2] == [0.0, 0.0]:
+        return None
     return [(neck[0] + pelvis[0]) / 2.0, (neck[1] + pelvis[1]) / 2.0]
 
-
 # ============================================================
-# 第二部分：触发先决条件
+# 第二部分：进阶版核心 - 置信度抑制 (Confidence Suppression)
 # ============================================================
 
-def check_proximity_condition(
-    track_a: SkeletonTrack,
-    track_b: SkeletonTrack,
+def compute_confidence_suppression(
+    track_a: SkeletonTrack, 
+    track_b: SkeletonTrack, 
     frame_idx: int,
-    tau_dist: float,
-    scale_a: float,
-    scale_b: float,
-) -> Tuple[bool, float]:
+    tau_c: float = 0.5
+) -> float:
     """
-    检查单帧的归一化中心距离是否满足近身条件。
-
-    公式：D_AB = ||C_A - C_B|| / ((S_A + S_B) / 2)
-    触发条件：D_AB < τ_dist
-
-    返回：(是否满足条件, 归一化距离值)
+    计算 A -> B 方向的置信度抑制系数 γ_t。
+    核心点 Q = {A的肩肘腕髋膝踝, B的颈骨盆头}
+    当 YOLO 发生严重遮挡或跟丢时，此函数将直接把危险得分压制为 0！
     """
     if frame_idx >= len(track_a.keypoints) or frame_idx >= len(track_b.keypoints):
-        return False, float("inf")
-
+        return 0.0
+        
     kp_a = track_a.keypoints[frame_idx]
     kp_b = track_b.keypoints[frame_idx]
-
-    center_a = get_body_center_formula(kp_a)
-    center_b = get_body_center_formula(kp_b)
-
-    if center_a is None or center_b is None:
-        return False, float("inf")
-
-    raw_dist  = euclidean_distance(center_a, center_b)
-    avg_scale = (scale_a + scale_b) / 2.0
-    norm_dist = raw_dist / avg_scale if avg_scale > 1e-6 else raw_dist
-
-    return norm_dist < tau_dist, norm_dist
-
-
-def find_proximity_windows(
-    track_a: SkeletonTrack,
-    track_b: SkeletonTrack,
-    tau_dist: float,
-    window_w: int,
-) -> List[Tuple[int, int]]:
-    """
-    找出所有满足"连续W帧内距离均小于τ_dist"的时间窗。
-
-    公式：∀τ ∈ [t-W+1, t], D_AB^τ < τ_dist
-
-    返回：[(start_frame, end_frame), ...] 的列表
-    """
-    n_frames = min(len(track_a.keypoints), len(track_b.keypoints))
-
-    # 预计算每帧的肩距尺度
-    scales_a = [get_shoulder_scale(kp) for kp in track_a.keypoints[:n_frames]]
-    scales_b = [get_shoulder_scale(kp) for kp in track_b.keypoints[:n_frames]]
-
-    # 计算每帧是否满足近身条件
-    prox_flags = []
-    for i in range(n_frames):
-        ok, _ = check_proximity_condition(
-            track_a, track_b, i, tau_dist, scales_a[i], scales_b[i]
-        )
-        prox_flags.append(ok)
-
-    # 滑窗检测：连续W帧都满足才算触发
-    windows = []
-    i = 0
-    while i <= n_frames - window_w:
-        if all(prox_flags[i: i + window_w]):
-            # 找到一个触发窗，继续延伸直到条件不满足
-            start = i
-            end   = i + window_w
-            while end < n_frames and prox_flags[end]:
-                end += 1
-            windows.append((start, end - 1))
-            i = end
-        else:
-            i += 1
-
-    return windows
-
+    
+    a_parts = [
+        "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+        "left_wrist", "right_wrist", "left_hip", "right_hip",
+        "left_knee", "right_knee", "left_ankle", "right_ankle"
+    ]
+    
+    confs = []
+    for part in a_parts:
+        confs.append(kp_a.get(part, [0, 0, 0.0])[2])
+        
+    # B 的头部近似 (nose)
+    confs.append(kp_b.get("nose", [0, 0, 0.0])[2])
+    # B 的骨盆置信度近似
+    pelvis_conf = (kp_b.get("left_hip", [0,0,0])[2] + kp_b.get("right_hip", [0,0,0])[2]) / 2.0
+    confs.append(pelvis_conf)
+    
+    avg_c = sum(confs) / len(confs) if confs else 0.0
+    
+    if avg_c >= tau_c:
+        return 1.0
+    else:
+        return avg_c / (tau_c + 1e-6)
 
 # ============================================================
-# 第三部分：动作特征提取
+# 第三部分：物理运动学特征提取 (涵盖上下肢)
 # ============================================================
 
-def compute_wrist_acceleration(
-    track: SkeletonTrack,
-    frame_idx: int,
-    dt: float,
-    side: str = "right",
+def compute_limb_acceleration(
+    track: SkeletonTrack, frame_idx: int, dt: float, part_type: str = "wrist"
 ) -> float:
-    wrist_key = f"{side}_wrist"
-
-    if frame_idx < 2 or frame_idx >= len(track.keypoints):
-        return 0.0
-
+    """
+    计算肢体末端（手腕或脚踝）的线加速度。
+    """
+    if frame_idx < 2 or frame_idx >= len(track.keypoints): return 0.0
+    
     kp_t   = track.keypoints[frame_idx]
     kp_t1  = track.keypoints[frame_idx - 1]
     kp_t2  = track.keypoints[frame_idx - 2]
-
-    w_t  = kp_t.get(wrist_key)
-    w_t1 = kp_t1.get(wrist_key)
-    w_t2 = kp_t2.get(wrist_key)
-
-    if w_t is None or w_t1 is None or w_t2 is None:
-        return 0.0
+    
+    max_accel = 0.0
+    for side in ["left", "right"]:
+        key = f"{side}_{part_type}"
+        p_t, p_t1, p_t2 = kp_t.get(key), kp_t1.get(key), kp_t2.get(key)
         
-    # 修复 YOLO 视觉丢失导致的 [0.0, 0.0] 瞬移 Bug
-    if w_t == [0.0, 0.0] or w_t1 == [0.0, 0.0] or w_t2 == [0.0, 0.0]:
-        return 0.0
-
-    # 【成功之刃 1：物理常识过滤器】
-    # 如果手腕在 1 帧内移动超过画面的 15% (归一化距离 0.15)
-    # 这在物理上是不可能的，绝对是 YOLO 发生了肢体错位（Limb Swapping）
-    # 直接忽略这帧的加速度，防止数学爆炸！
-    dist_t = euclidean_distance(w_t, w_t1)
-    dist_t1 = euclidean_distance(w_t1, w_t2)
-    if dist_t > 0.15 or dist_t1 > 0.15:
-        return 0.0
-
-    # 2D 视频已经归一化，强制 scale 为 1.0
-    scale = 1.0 
-
-    v_t  = dist_t / (scale * dt)
-    v_t1 = dist_t1 / (scale * dt)
-
-    return abs(v_t - v_t1) / dt
-
-
-def compute_attack_distance(
-    track_a: SkeletonTrack,
-    track_b: SkeletonTrack,
-    frame_idx: int,
-    side: str = "right",
-) -> float:
-    """
-    计算攻击距离：施力方手腕到受力方头部的归一化距离。
-
-    公式：d_attack = ||K_A,wrist - K_B,head|| / ((S_A + S_B) / 2)
-    """
-    if frame_idx >= len(track_a.keypoints) or frame_idx >= len(track_b.keypoints):
-        return float("inf")
-
-    kp_a = track_a.keypoints[frame_idx]
-    kp_b = track_b.keypoints[frame_idx]
-
-    wrist_key = f"{side}_wrist"
-    wrist = kp_a.get(wrist_key)
-    head  = kp_b.get("nose")  # COCO-17用nose近似head
-
-    if wrist is None or head is None:
-            return float("inf")
+        if not (p_t and p_t1 and p_t2): continue
+        if p_t[:2] == [0,0] or p_t1[:2] == [0,0] or p_t2[:2] == [0,0]: continue
         
-    # 修复 YOLO 视觉丢失 Bug
-    if wrist == [0.0, 0.0] or head == [0.0, 0.0]:
-        return float("inf")
+        v_t  = euclidean_distance(p_t, p_t1) / dt
+        v_t1 = euclidean_distance(p_t1, p_t2) / dt
+        max_accel = max(max_accel, abs(v_t - v_t1) / dt)
+        
+    return max_accel
 
-
-    raw_dist  = euclidean_distance(wrist, head)
-    avg_scale = (get_shoulder_scale(kp_a) + get_shoulder_scale(kp_b)) / 2.0
-
-    return raw_dist / avg_scale if avg_scale > 1e-6 else raw_dist
-
-
-def compute_relative_approach_speed(
-    track_a: SkeletonTrack,
-    track_b: SkeletonTrack,
-    frame_idx: int,
-    dt: float,
-    side: str = "right",
+def compute_joint_angular_acceleration(
+    track: SkeletonTrack, frame_idx: int, dt: float, joint_type: str = "elbow"
 ) -> float:
     """
-    计算相对接近速度 v_rel。
-
-    公式：v_rel^t = (d_attack^(t-1) - d_attack^t) / Δt
-    正值表示正在接近，负值表示远离。
+    计算关节（肘部或膝部）的角加速度。
     """
-    if frame_idx < 1:
-        return 0.0
+    if frame_idx < 2 or frame_idx >= len(track.keypoints): return 0.0
+    
+    def _get_angle(kp: dict, side: str) -> Optional[float]:
+        if joint_type == "elbow":
+            p1, p2, p3 = kp.get(f"{side}_shoulder"), kp.get(f"{side}_elbow"), kp.get(f"{side}_wrist")
+        else:
+            p1, p2, p3 = kp.get(f"{side}_hip"), kp.get(f"{side}_knee"), kp.get(f"{side}_ankle")
+            
+        if not (p1 and p2 and p3): return None
+        if p1[:2] == [0,0] or p2[:2] == [0,0] or p3[:2] == [0,0]: return None
+        
+        v1 = [p1[0] - p2[0], p1[1] - p2[1]]
+        v2 = [p3[0] - p2[0], p3[1] - p2[1]]
+        dot = v1[0]*v2[0] + v1[1]*v2[1]
+        norm = math.sqrt(v1[0]**2 + v1[1]**2) * math.sqrt(v2[0]**2 + v2[1]**2)
+        if norm < 1e-6: return None
+        return math.acos(max(-1.0, min(1.0, dot / norm)))
 
-    d_t  = compute_attack_distance(track_a, track_b, frame_idx,     side)
-    d_t1 = compute_attack_distance(track_a, track_b, frame_idx - 1, side)
+    max_alpha = 0.0
+    for side in ["left", "right"]:
+        theta_t  = _get_angle(track.keypoints[frame_idx], side)
+        theta_t1 = _get_angle(track.keypoints[frame_idx - 1], side)
+        theta_t2 = _get_angle(track.keypoints[frame_idx - 2], side)
+        
+        if theta_t is not None and theta_t1 is not None and theta_t2 is not None:
+            omega_t  = (theta_t - theta_t1) / dt
+            omega_t1 = (theta_t1 - theta_t2) / dt
+            max_alpha = max(max_alpha, abs(omega_t - omega_t1) / dt)
+            
+    return max_alpha
 
-    if d_t == float("inf") or d_t1 == float("inf"):
-        return 0.0
-
-    return (d_t1 - d_t) / dt
-
-
-def compute_elbow_angle(kp: dict, side: str = "right") -> Optional[float]:
-    """
-    计算肘关节角度（余弦定理）。
-
-    公式：θ = arccos( (p1-p2)·(p3-p2) / (||p1-p2|| * ||p3-p2||) )
-    其中 p1=肩, p2=肘, p3=腕
-    """
-    shoulder_key = f"{side}_shoulder"
-    elbow_key    = f"{side}_elbow"
-    wrist_key    = f"{side}_wrist"
-
-    p1 = kp.get(shoulder_key)
-    p2 = kp.get(elbow_key)
-    p3 = kp.get(wrist_key)
-
-    if p1 is None or p2 is None or p3 is None:
-        return None
-
-    # 向量 p1→p2 和 p3→p2
-    v1 = [p1[0] - p2[0], p1[1] - p2[1]]
-    v2 = [p3[0] - p2[0], p3[1] - p2[1]]
-
-    dot   = v1[0] * v2[0] + v1[1] * v2[1]
-    norm1 = math.sqrt(v1[0] ** 2 + v1[1] ** 2)
-    norm2 = math.sqrt(v2[0] ** 2 + v2[1] ** 2)
-
-    if norm1 < 1e-6 or norm2 < 1e-6:
-        return None
-
-    cos_val = max(-1.0, min(1.0, dot / (norm1 * norm2)))  # 防止浮点误差越界
-    return math.acos(cos_val)
-
-
-def compute_elbow_angular_acceleration(
-    track: SkeletonTrack,
-    frame_idx: int,
-    dt: float,
-    side: str = "right",
-) -> float:
-    if frame_idx < 2 or frame_idx >= len(track.keypoints):
-        return 0.0
-
-    # 【成功之刃 2：防止角加速度爆炸】
-    # 检查手腕是否发生了瞬间瞬移
-    wrist_key = f"{side}_wrist"
-    w_t = track.keypoints[frame_idx].get(wrist_key)
-    w_t1 = track.keypoints[frame_idx - 1].get(wrist_key)
-    if w_t and w_t1 and w_t != [0.0, 0.0] and w_t1 != [0.0, 0.0]:
-        if euclidean_distance(w_t, w_t1) > 0.15:
-            return 0.0  # YOLO 肢体错位，忽略该帧
-
-    theta_t  = compute_elbow_angle(track.keypoints[frame_idx],     side)
-    theta_t1 = compute_elbow_angle(track.keypoints[frame_idx - 1], side)
-    theta_t2 = compute_elbow_angle(track.keypoints[frame_idx - 2], side)
-
-    if theta_t is None or theta_t1 is None or theta_t2 is None:
-        return 0.0
-
-    omega_t  = (theta_t  - theta_t1) / dt
-    omega_t1 = (theta_t1 - theta_t2) / dt
-
-    return abs(omega_t - omega_t1) / dt
-
-
-def compute_torso_tilt_change(
-    track: SkeletonTrack,
-    frame_idx: int,
-    n_interval: int = 3,
-) -> float:
-    """
-    计算受力方躯干倾角短时变化量 Δφ_B。
-
-    公式：
-      V_torso = K_Neck - K_Pelvis  （颈部到骨盆的向量）
-      φ = arctan2(V_torso_x, V_torso_y)  （与竖直方向夹角）
-      Δφ = |φ^t - φ^(t-n)|
-    """
-    if frame_idx < n_interval or frame_idx >= len(track.keypoints):
-        return 0.0
-
+def compute_torso_tilt_change(track: SkeletonTrack, frame_idx: int, n_interval: int = 3) -> float:
+    """计算受力侧躯干倾角短时变化量 Δφ_B"""
+    if frame_idx < n_interval or frame_idx >= len(track.keypoints): return 0.0
+    
     def _get_tilt(kp: dict) -> Optional[float]:
-        neck   = get_neck_approx(kp)
-        pelvis = get_pelvis_approx(kp)
-        if neck is None or pelvis is None:
-            return None
-        vx = neck[0] - pelvis[0]
-        vy = neck[1] - pelvis[1]
-        return math.atan2(vx, vy)  # 与竖直方向（y轴）的夹角
+        neck, pelvis = get_neck_approx(kp), get_pelvis_approx(kp)
+        if neck[:2] == [0,0] or pelvis[:2] == [0,0]: return None
+        return math.atan2(neck[0] - pelvis[0], neck[1] - pelvis[1])
 
     phi_t  = _get_tilt(track.keypoints[frame_idx])
     phi_tn = _get_tilt(track.keypoints[frame_idx - n_interval])
-
-    if phi_t is None or phi_tn is None:
-        return 0.0
-
+    
+    if phi_t is None or phi_tn is None: return 0.0
     return abs(phi_t - phi_tn)
 
+def compute_attack_distance(track_a: SkeletonTrack, track_b: SkeletonTrack, frame_idx: int) -> float:
+    """计算施力侧末端（手/脚）到受力侧部位的最小距离"""
+    if frame_idx >= len(track_a.keypoints) or frame_idx >= len(track_b.keypoints): return float("inf")
+    kp_a, kp_b = track_a.keypoints[frame_idx], track_b.keypoints[frame_idx]
+    
+    ends_a = [kp_a.get("left_wrist"), kp_a.get("right_wrist"), kp_a.get("left_ankle"), kp_a.get("right_ankle")]
+    targets_b = [get_neck_approx(kp_b), get_pelvis_approx(kp_b)]
+    
+    min_dist = float("inf")
+    for p_a in ends_a:
+        if not p_a or p_a[:2] == [0,0]: continue
+        for p_b in targets_b:
+            if not p_b or p_b[:2] == [0,0]: continue
+            min_dist = min(min_dist, euclidean_distance(p_a, p_b))
+    return min_dist
+
+def compute_relative_approach_speed(track_a: SkeletonTrack, track_b: SkeletonTrack, frame_idx: int, dt: float) -> float:
+    """计算相对接近速度"""
+    if frame_idx < 1: return 0.0
+    d_t  = compute_attack_distance(track_a, track_b, frame_idx)
+    d_t1 = compute_attack_distance(track_a, track_b, frame_idx - 1)
+    if d_t == float("inf") or d_t1 == float("inf"): return 0.0
+    return max(0.0, (d_t1 - d_t) / dt) # 只关心接近（正值）
+
+
 
 # ============================================================
-# 第四部分：攻击部位权重判定
-# ============================================================
-
-def get_attack_part_weight(attack_dist_to_parts: dict) -> Tuple[float, str]:
-    """
-    根据攻击距离判定受力部位，返回对应权重。
-
-    权重配置（来自建模公式.pdf）：
-      头部/颈部  → W_part = 1.5
-      胸腹/躯干  → W_part = 1.2
-      四肢       → W_part = 0.8
-
-    参数：
-        attack_dist_to_parts: {"head": dist, "torso": dist, "limbs": dist}
-
-    返回：(权重值, 受攻击部位名称)
-    """
-    min_part = min(attack_dist_to_parts, key=attack_dist_to_parts.get)
-    weights  = {"head": 1.5, "torso": 1.2, "limbs": 0.8}
-    return weights[min_part], min_part
-
-
-# ============================================================
-# 第五部分：特征归一化与评分
+# 第四部分：特征归一化与双向评分模型
 # ============================================================
 
 def normalize_feature(value: float, min_val: float, max_val: float) -> float:
-    """
-    将特征值归一化到 [0, 1]。
-
-    公式：r_i = max(0, min(1, (x_i - min_i) / (max_i - min_i)))
-    """
-    if max_val <= min_val:
-        return 0.0
+    if max_val <= min_val: return 0.0
     return max(0.0, min(1.0, (value - min_val) / (max_val - min_val)))
 
-
-def compute_frame_score(
-    track_a: SkeletonTrack,
-    track_b: SkeletonTrack,
-    frame_idx: int,
-    cfg: dict,
-    dt: float = 1.0 / 30.0,
+def compute_directional_score(
+    track_a: SkeletonTrack, track_b: SkeletonTrack, frame_idx: int, cfg: dict, dt: float
 ) -> Tuple[float, dict]:
     """
-    计算单帧的冲突综合得分。
-
-    公式：
-      Score_base = w1*r(a_A) + w2*r(v_rel) + w3*r(α_A) + w4*r(Δφ_B)
-      P          = 1 + β * r(a_A) * W_part
-      Score_final= Score_base * P
-
-    返回：(最终得分, 各特征详情字典)
+    计算单向 (A -> B) 的综合得分与特征详情。
+    严格落实置信度抑制和熵权法客观权重。
     """
-    rules = cfg["rules"]
-
-    # ── 提取四个核心特征（取左右手腕的最大值）──
-    a_A     = max(
-        compute_wrist_acceleration(track_a, frame_idx, dt, "right"),
-        compute_wrist_acceleration(track_a, frame_idx, dt, "left"),
+    # 1. 提取物理特征 (涵盖上下肢)
+    a_limb = max(
+        compute_limb_acceleration(track_a, frame_idx, dt, "wrist"),
+        compute_limb_acceleration(track_a, frame_idx, dt, "ankle")
     )
-    v_rel   = max(
-        compute_relative_approach_speed(track_a, track_b, frame_idx, dt, "right"),
-        compute_relative_approach_speed(track_a, track_b, frame_idx, dt, "left"),
-        0.0,  # 只关心接近，远离取0
-    )
-    alpha_A = max(
-        compute_elbow_angular_acceleration(track_a, frame_idx, dt, "right"),
-        compute_elbow_angular_acceleration(track_a, frame_idx, dt, "left"),
+    v_rel = compute_relative_approach_speed(track_a, track_b, frame_idx, dt)
+    alpha_joint = max(
+        compute_joint_angular_acceleration(track_a, frame_idx, dt, "elbow"),
+        compute_joint_angular_acceleration(track_a, frame_idx, dt, "knee")
     )
     delta_phi_B = compute_torso_tilt_change(track_b, frame_idx)
-
-    # ── 特征归一化 ──
-    # 归一化区间参考建模公式，可在 default.yaml 中扩展
-    r_aA        = normalize_feature(a_A,         0.0, 50.0)
-    r_vrel      = normalize_feature(v_rel,        0.0, 10.0)
-    r_alphaA    = normalize_feature(alpha_A,      0.0, 100.0)
-    r_deltaPhiB = normalize_feature(delta_phi_B,  0.0, 1.0)
-
-    # ── 权重（基于 451 个样本的熵权法客观赋权）──
-    # w1: 腕部线加速度 (0.4926)  - 区分度最高，体现爆发力
-    # w2: 相对接近速度 (0.2130)
-    # w3: 肘部角加速度 (0.1218)
-    # w4: 躯干倾角变化 (0.1726)
+    
+    # 2. 归一化 (区间上限可根据 EDA 结果微调)
+    r_a = normalize_feature(a_limb, 0.0, 50.0)
+    r_v = normalize_feature(v_rel, 0.0, 10.0)
+    r_alpha = normalize_feature(alpha_joint, 0.0, 100.0)
+    r_phi = normalize_feature(delta_phi_B, 0.0, 1.0)
+    
+    # 3. 熵权法客观权重 (来自阶段A数据驱动结果)
     w1, w2, w3, w4 = 0.4926, 0.2130, 0.1218, 0.1726
-
-
-    # ── 基础得分 ──
-    score_base = w1 * r_aA + w2 * r_vrel + w3 * r_alphaA + w4 * r_deltaPhiB
-
-    # ── 攻击部位权重 ──
-    d_head  = compute_attack_distance(track_a, track_b, frame_idx, "right")
-    d_torso = euclidean_distance(
-        track_a.keypoints[frame_idx].get("right_wrist", [0, 0]),
-        get_pelvis_approx(track_b.keypoints[frame_idx]) or [0, 0],
-    ) if frame_idx < len(track_a.keypoints) and frame_idx < len(track_b.keypoints) else float("inf")
-    d_limbs = euclidean_distance(
-        track_a.keypoints[frame_idx].get("right_wrist", [0, 0]),
-        track_b.keypoints[frame_idx].get("right_knee", [0, 0]),
-    ) if frame_idx < len(track_a.keypoints) and frame_idx < len(track_b.keypoints) else float("inf")
-
-    w_part, hit_part = get_attack_part_weight({
-        "head": d_head, "torso": d_torso, "limbs": d_limbs
-    })
-
-    # ── 惩罚因子 ──
-    beta  = 0.5  # 调节系数，可后续移入 yaml
-    P     = 1.0 + beta * r_aA * w_part
-
-    # ── 最终得分 ──
-    score_final = score_base * P
-
+    score_base = w1 * r_a + w2 * r_v + w3 * r_alpha + w4 * r_phi
+    
+    # 4. 攻击部位惩罚因子 (简化近似：手腕到头部的距离)
+    kp_a, kp_b = track_a.keypoints[frame_idx], track_b.keypoints[frame_idx]
+    w_part = 1.0
+    if frame_idx < len(track_a.keypoints) and frame_idx < len(track_b.keypoints):
+        head_b = get_neck_approx(kp_b)
+        wrist_a = kp_a.get("right_wrist", [0.0, 0.0, 0.0])
+        if head_b[:2] != [0.0, 0.0] and wrist_a[:2] != [0.0, 0.0]:
+            dist = euclidean_distance(wrist_a, head_b)
+            if dist < 0.2: w_part = 1.5
+            elif dist < 0.4: w_part = 1.2
+            else: w_part = 0.8
+            
+    beta = 0.5
+    P_t = 1.0 + beta * r_a * w_part
+    
+    # 5. 置信度抑制系数 (核心抗噪点机制)
+    gamma_t = compute_confidence_suppression(track_a, track_b, frame_idx, tau_c=0.5)
+    
+    # 6. 最终单向得分
+    score_final = gamma_t * score_base * P_t
+    
     details = {
-        "a_A":       round(a_A,         4),
-        "v_rel":     round(v_rel,        4),
-        "alpha_A":   round(alpha_A,      4),
-        "delta_phi": round(delta_phi_B,  4),
-        "r_aA":      round(r_aA,         4),
-        "r_vrel":    round(r_vrel,        4),
-        "r_alphaA":  round(r_alphaA,     4),
-        "r_dphi":    round(r_deltaPhiB,  4),
-        "score_base":  round(score_base,  4),
-        "w_part":      w_part,
-        "hit_part":    hit_part,
-        "P":           round(P,           4),
-        "score_final": round(score_final, 4),
+        "r_a": r_a, "r_v": r_v, "r_alpha": r_alpha, "r_phi": r_phi,
+        "gamma": gamma_t, "P": P_t
     }
     return score_final, details
 
+# ============================================================
+# 第五部分：四段式状态机与事件确认 (FSM)
+# ============================================================
 
 # ============================================================
-# 第六部分：滑窗平均与报警判决
+# 第五部分：实战优化版四段式状态机 (FSM) - 异步响应记忆
 # ============================================================
 
-def sliding_window_avg(scores: List[float], window_m: int) -> List[float]:
+class CaptainStateMachine:
     """
-    对得分序列做滑窗平均。
-
-    公式：Score_final_avg^t = (1/M) * Σ Score_final^(t-m), m=0..M-1
+    基于队长公式的实战优化版。
+    核心改进：引入“异步记忆缓存”，解决真实物理世界中“施力”与“受力”的时间差问题。
     """
-    result = []
-    for i in range(len(scores)):
-        start    = max(0, i - window_m + 1)
-        window   = scores[start: i + 1]
-        result.append(sum(window) / len(window))
-    return result
+    def __init__(self, cfg: dict):
+        rules = cfg.get("rules", {})
+        self.tau_dist = 2.0       
+        self.W = 2                
+        self.R = 15               
+        self.tau_v = 0.3          
+        self.tau_a = 0.3          
+        self.tau_alpha = 0.3      
+        self.tau_phi = 0.2        
+        self.alert_threshold = rules.get("alert_threshold", 0.20)
+        self.M = 5                
+        
+        self.state = 0            
+        self.prox_buffer = 0      
+        self.sep_buffer = 0       
+        self.score_buffer = []    
+        self.in_event = False     
+        
+        # 【实战优化：异步记忆缓存】
+        # 记录某一方发起攻击后，有效等待对方响应的帧数
+        self.action_memory_ab = 0 
+        self.action_memory_ba = 0 
+        self.memory_window = 15   # 允许 15 帧 (0.5秒) 的物理延迟
+
+    def update(self, dist: float, details_ab: dict, details_ba: dict, score_pair: float) -> Tuple[bool, float]:
+        # 0. 异步记忆衰减
+        if self.action_memory_ab > 0: self.action_memory_ab -= 1
+        if self.action_memory_ba > 0: self.action_memory_ba -= 1
+
+        # (4) 冻结/重置逻辑
+        if dist > self.tau_dist:
+            self.sep_buffer += 1
+        else:
+            self.sep_buffer = 0
+            
+        if self.sep_buffer >= self.R:
+            self.state = 0
+            self.prox_buffer = 0
+            self.score_buffer.clear()
+            self.in_event = False
+            self.action_memory_ab = 0
+            self.action_memory_ba = 0
+            return False, 0.0
+
+        # (1) 接近阶段
+        if dist < self.tau_dist:
+            self.prox_buffer += 1
+        else:
+            self.prox_buffer = 0
+            
+        if self.state == 0 and self.prox_buffer >= self.W:
+            self.state = 1
+
+        # (2) 动作激活阶段 & 记录攻击动作
+        if self.state >= 1:
+            # 如果 A 有高爆发，记住 A 的攻击
+            if details_ab.get("r_v", 0) > self.tau_v or details_ab.get("r_a", 0) > self.tau_a or details_ab.get("r_alpha", 0) > self.tau_alpha:
+                self.action_memory_ab = self.memory_window
+                if self.state < 2: self.state = 2
+                
+            # 如果 B 有高爆发，记住 B 的攻击
+            if details_ba.get("r_v", 0) > self.tau_v or details_ba.get("r_a", 0) > self.tau_a or details_ba.get("r_alpha", 0) > self.tau_alpha:
+                self.action_memory_ba = self.memory_window
+                if self.state < 2: self.state = 2
+
+        # (3) 作用-响应阶段 (实战版：异步链条)
+        if self.state >= 2:
+            response_formed = False
+            # A 之前攻击过 (记忆仍在)，且现在 B 身体发生倾斜
+            if self.action_memory_ab > 0 and details_ab.get("r_phi", 0) > self.tau_phi:
+                response_formed = True
+            # B 之前攻击过 (记忆仍在)，且现在 A 身体发生倾斜
+            if self.action_memory_ba > 0 and details_ba.get("r_phi", 0) > self.tau_phi:
+                response_formed = True
+                
+            if response_formed:
+                self.state = 3  # 物理链条彻底闭环！
+
+        # (5) 事件确认阶段
+        self.score_buffer.append(score_pair)
+        if len(self.score_buffer) > self.M:
+            self.score_buffer.pop(0)
+            
+        smoothed_score = sum(self.score_buffer) / len(self.score_buffer) if self.score_buffer else 0.0
+
+        if self.state == 3 and smoothed_score > self.alert_threshold:
+            self.in_event = True
+        
+        return self.in_event, smoothed_score
+
 
 
 # ============================================================
-# 第七部分：主入口 — 对一个clip执行完整规则流
+# 第六部分：主入口 — 端到端规则流
 # ============================================================
 
 def run_rules_on_clip(
-    track_set: TrackSet,
-    cfg: Optional[dict] = None,
+    track_set: TrackSet, cfg: Optional[dict] = None
 ) -> List[InteractionEvent]:
-    """
-    使用【状态机】重构的端到端规则流。
-    彻底废弃扁平的滑窗逻辑，利用状态流转抵抗 2D 视频中的瞬间噪点误报。
-    """
-    from fightguard.detection.pairing import get_interaction_pairs
-
-    if cfg is None:
-        cfg = get_config()
-
+    from fightguard.detection.pairing import get_interaction_pairs, compute_pair_distance_at_frame
+    
+    if cfg is None: cfg = get_config()
+    
     rules = cfg["rules"]
-   
-    # 【逻辑优化】在 2D 视频中彻底解除空间距离封印。
-    # 只要他们是画面里配对成功的两人，就直接计算物理动作特征，由状态机和得分来裁决！
-    tau_dist = 2.0 
- 
-
+    tau_dist = 2.0  # 2D 视频中放宽空间封印，由状态机主导
     alert_threshold = rules.get("alert_threshold", 0.20)
     dt = 1.0 / track_set.fps
-
+    
     events: List[InteractionEvent] = []
     pairs = get_interaction_pairs(track_set, cfg)
+    if not pairs: return events
     
-    if not pairs:
-        return events # 暂略单人降级，专注双人状态机
-
     for track_a, track_b in pairs:
         n_frames = min(len(track_a.keypoints), len(track_b.keypoints))
         
-        # 预计算所有帧的肩距尺度和近身状态
-        scales_a = [get_shoulder_scale(kp) for kp in track_a.keypoints[:n_frames]]
-        scales_b = [get_shoulder_scale(kp) for kp in track_b.keypoints[:n_frames]]
-        
-        # 初始化状态机 (连续 1 帧高分触发，30 帧冷却防碎片化)
-        fsm = PairStateMachine(conflict_threshold=1, cooldown_frames=30)
-        
-        in_event = False
-        event_start = 0
-        event_max_score = 0.0
-        triggered_rules_set = set()
+        # 实例化严格遵循队长 PDF 的状态机
+        fsm = CaptainStateMachine(cfg)
 
+        event_start = 0
+        max_event_score = 0.0
+        triggered_rules = set()
+        
         for fi in range(n_frames):
-            # 1. 判断是否近身 (2D 环境下放宽)
-            is_prox, _ = check_proximity_condition(track_a, track_b, fi, tau_dist, scales_a[fi], scales_b[fi])
+            # 1. 计算归一化距离
+            dist = compute_pair_distance_at_frame(track_a, track_b, fi)
+            if dist is None: dist = float("inf")
             
-            # 2. 计算本帧得分
-            score = 0.0
-            details = {}
-            if is_prox:
-                score, details = compute_frame_score(track_a, track_b, fi, cfg, dt)
+            # 2. 双向评分计算
+            score_ab, det_ab = compute_directional_score(track_a, track_b, fi, cfg, dt)
+            score_ba, det_ba = compute_directional_score(track_b, track_a, fi, cfg, dt)
             
-            # 3. 状态机流转
-            current_state = fsm.update(is_prox, score, alert_threshold)
+            # 3. 取主导分数
+            score_pair = max(score_ab, score_ba)
             
-            # 4. 根据状态机生成事件
-            if current_state == "CONFLICT" and not in_event:
-                in_event = True
+            
+            # 4. 状态机更新
+            was_in_event = fsm.in_event
+            is_in_event, smoothed_score = fsm.update(dist, det_ab, det_ba, score_pair)
+
+            
+            # 5. 事件生成逻辑
+            if is_in_event and not was_in_event:
                 event_start = fi
-                event_max_score = score
-                triggered_rules_set.clear()
+                max_event_score = smoothed_score
+                triggered_rules.clear()
+            
+            elif is_in_event:
+                max_event_score = max(max_event_score, smoothed_score)
+                # 收集触发规则
+                dominant_det = det_ab if score_ab > score_ba else det_ba
+                if dominant_det["r_a"] > 0.3: triggered_rules.add("high_limb_accel")
+                if dominant_det["r_alpha"] > 0.3: triggered_rules.add("high_joint_angular_accel")
+                if dominant_det["r_phi"] > 0.3: triggered_rules.add("torso_tilt_change")
+                if dominant_det["gamma"] < 0.5: triggered_rules.add("low_confidence_suppressed") # 记录被抑制的情况
                 
-            elif current_state == "CONFLICT" and in_event:
-                event_max_score = max(event_max_score, score)
-                # 收集触发的规则
-                if details.get("r_aA", 0) > 0.3: triggered_rules_set.add("high_wrist_accel")
-                if details.get("r_alphaA", 0) > 0.3: triggered_rules_set.add("high_elbow_angular_accel")
-                if details.get("r_dphi", 0) > 0.3: triggered_rules_set.add("torso_tilt_change")
-                
-            elif current_state == "NORMAL" and in_event:
-                # 冲突结束（冷却期已过）
-                in_event = False
+            elif not is_in_event and was_in_event:
                 events.append(InteractionEvent(
                     clip_id=track_set.clip_id,
                     event_type="child_conflict",
                     start_frame=event_start,
-                    end_frame=fi - fsm.cooldown_frames, # 剔除冷却期的空转帧
+                    end_frame=max(0, fi - fsm.R), # 剔除分开的重置帧
                     track_ids=[track_a.track_id, track_b.track_id],
-                    score=round(event_max_score, 3),
-                    triggered_rules=list(triggered_rules_set),
+                    score=round(max_event_score, 3),
+                    triggered_rules=list(triggered_rules),
                     teacher_present=False,
                     region="unknown"
                 ))
-
-        # 处理视频结束时仍在冲突中的情况
-        if in_event:
+                
+        # 处理结尾仍在冲突中的情况
+        if fsm.in_event:
             events.append(InteractionEvent(
                 clip_id=track_set.clip_id,
                 event_type="child_conflict",
                 start_frame=event_start,
                 end_frame=n_frames - 1,
                 track_ids=[track_a.track_id, track_b.track_id],
-                score=round(event_max_score, 3),
-                triggered_rules=list(triggered_rules_set),
+                score=round(max_event_score, 3),
+                triggered_rules=list(triggered_rules),
                 teacher_present=False,
                 region="unknown"
             ))
-
+            
     return events
 
-
 # ============================================================
-# 第八部分：双人角色互换 — 对称检测
+# 兼容旧接口
 # ============================================================
-
-def run_rules_symmetric(
-    track_set: TrackSet,
-    cfg: Optional[dict] = None,
-) -> List[InteractionEvent]:
-    """
-    对称地运行规则流：同时以 A攻B 和 B攻A 两种视角检测，
-    取两次结果的并集，避免漏报。
-
-    在 NTU 数据集中，"施力方"和"受力方"的角色并不总是固定的，
-    对称检测能提升召回率。
-    """
-    from fightguard.detection.pairing import get_interaction_pairs
-
-    if cfg is None:
-        cfg = get_config()
-
-    pairs = get_interaction_pairs(track_set, cfg)
-    if not pairs:
-        return []
-
-    all_events: List[InteractionEvent] = []
-
-    for track_a, track_b in pairs:
-        # 视角1：A为施力方，B为受力方
-        ts_ab = TrackSet(
-            clip_id      = track_set.clip_id,
-            label        = track_set.label,
-            tracks       = [track_a, track_b],
-            fps          = track_set.fps,
-            total_frames = track_set.total_frames,
-        )
-        events_ab = run_rules_on_clip(ts_ab, cfg)
-
-        # 视角2：B为施力方，A为受力方
-        ts_ba = TrackSet(
-            clip_id      = track_set.clip_id,
-            label        = track_set.label,
-            tracks       = [track_b, track_a],
-            fps          = track_set.fps,
-            total_frames = track_set.total_frames,
-        )
-        events_ba = run_rules_on_clip(ts_ba, cfg)
-
-        # 合并去重：同一帧范围内不重复计入
-        merged = _merge_events(events_ab + events_ba)
-        all_events.extend(merged)
-
-    return all_events
-
+def run_rules_symmetric(track_set: TrackSet, cfg: Optional[dict] = None) -> List[InteractionEvent]:
+    # 进阶版已内置双向检测，无需再反转轨迹调用
+    return run_rules_on_clip(track_set, cfg)
 
 def _merge_events(events: List[InteractionEvent]) -> List[InteractionEvent]:
-    """
-    合并时间上重叠的事件，避免对称检测产生重复报警。
-    策略：按 start_frame 排序，相邻事件若重叠则合并为一个。
-    """
-    if not events:
-        return []
-
-    events_sorted = sorted(events, key=lambda e: e.start_frame)
-    merged = [events_sorted[0]]
-
-    for ev in events_sorted[1:]:
-        last = merged[-1]
-        if ev.start_frame <= last.end_frame:
-            # 重叠，合并：取更大的 end_frame 和更高的 score
-            last.end_frame      = max(last.end_frame, ev.end_frame)
-            last.score          = max(last.score, ev.score)
-            last.triggered_rules = list(set(last.triggered_rules + ev.triggered_rules))
-        else:
-            merged.append(ev)
-
-    return merged
+    # 进阶版内置状态机，天然防碎片化，此函数保留作接口兼容
+    return events

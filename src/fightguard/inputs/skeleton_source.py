@@ -149,13 +149,22 @@ def _parse_one_body(lines: List[str], start_idx: int) -> Tuple[Keypoints, int]:
     # 注意：NTU 坐标是3D世界坐标（单位：米），不是归一化的
     # 这里先保留原始值，归一化在 pairing.py 中按需处理
     keypoints: Keypoints = {}
-    for coco_name in COCO17_KEYPOINT_NAMES:
-        ntu_idx = NTU_TO_COCO17[coco_name]
-        if ntu_idx < len(raw_joints):
-            keypoints[coco_name] = raw_joints[ntu_idx]
+    for coco_name, ntu_idx in NTU_TO_COCO17.items():
+        if ntu_idx < num_joints:
+            # NTU 数据格式：每个点 11 个值，前三个是 x, y, z
+            x = float(joint_data[ntu_idx * 11 + 0])
+            y = float(joint_data[ntu_idx * 11 + 1])
+            
+            if x == 0.0 and y == 0.0:
+                coco17_dict[coco_name] = [0.0, 0.0, 0.0]
+            else:
+                # NTU 是高精度 3D 摄录数据，有效点的置信度默认给满 1.0
+                coco17_dict[coco_name] = [x, y, 1.0]
         else:
-            keypoints[coco_name] = [0.0, 0.0]  # 缺失点用零填充
-
+            coco17_dict[coco_name] = [0.0, 0.0, 0.0]
+    
+    
+    
     # 归一化到 [0, 1]，统一坐标体系
     keypoints = _normalize_keypoints(keypoints)
 
@@ -165,18 +174,11 @@ def _parse_one_body(lines: List[str], start_idx: int) -> Tuple[Keypoints, int]:
 def _normalize_keypoints(keypoints: Keypoints) -> Keypoints:
     """
     对单帧关键点坐标做 min-max 归一化，将世界坐标（米制）压缩到 [0, 1]。
-    
-    NTU 原始坐标是3D世界坐标（单位：米），直接用于距离计算会与
-    归一化坐标体系的阈值不兼容。归一化后所有模块统一使用 [0,1] 坐标。
-    
-    归一化方式：
-        x_norm = (x - x_min) / (x_max - x_min)
-        y_norm = (y - y_min) / (y_max - y_min)
-    
-    如果所有点坐标相同（分母为0），保持原值不变。
+    【进阶版升级】：保留并透传第三个维度的置信度 conf。
     """
-    xs = [v[0] for v in keypoints.values() if v != [0.0, 0.0]]
-    ys = [v[1] for v in keypoints.values() if v != [0.0, 0.0]]
+    # 只取前两个维度 x, y 进行判断和极值计算
+    xs = [v[0] for v in keypoints.values() if v[:2] != [0.0, 0.0]]
+    ys = [v[1] for v in keypoints.values() if v[:2] != [0.0, 0.0]]
 
     if not xs or not ys:
         return keypoints  # 全为零点，无法归一化，原样返回
@@ -189,12 +191,15 @@ def _normalize_keypoints(keypoints: Keypoints) -> Keypoints:
 
     normalized: Keypoints = {}
     for name, coords in keypoints.items():
-        if coords == [0.0, 0.0]:
-            normalized[name] = [0.0, 0.0]  # 缺失点保持零
+        if coords[:2] == [0.0, 0.0]:
+            normalized[name] = [0.0, 0.0, 0.0]  # 缺失点保持全零
         else:
+            # 取出置信度，如果原来没有则默认为 1.0
+            conf = coords[2] if len(coords) > 2 else 1.0
             normalized[name] = [
                 (coords[0] - x_min) / x_range,
                 (coords[1] - y_min) / y_range,
+                conf
             ]
     return normalized
 

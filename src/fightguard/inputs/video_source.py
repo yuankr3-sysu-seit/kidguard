@@ -29,14 +29,26 @@ from fightguard.config import get_config
 # ============================================================
 _yolo_model = None
 
+#def get_yolo_model():
+   # """懒加载 YOLO 模型"""
+   # global _yolo_model
+    #if _yolo_model is None:
+        #print("[INFO] 正在加载 YOLOv8-Pose 模型 (首次加载可能需要下载)...")
+        # 使用轻量级的 yolov8n-pose.pt，适合 CPU 运行
+        #_yolo_model = YOLO("yolov8n-pose.pt")
+    #return _yolo_model
+
 def get_yolo_model():
-    """懒加载 YOLO 模型"""
+    """懒加载 YOLO 模型 (OpenVINO 硬件加速版)"""
     global _yolo_model
     if _yolo_model is None:
-        print("[INFO] 正在加载 YOLOv8-Pose 模型 (首次加载可能需要下载)...")
-        # 使用轻量级的 yolov8n-pose.pt，适合 CPU 运行
-        _yolo_model = YOLO("yolov8n-pose.pt")
+        print("[INFO] 正在加载 YOLOv8-Pose (OpenVINO 加速引擎)...")
+        # 直接加载刚才导出的 openvino 模型文件夹
+        # Ultralytics 会自动识别并调用 Intel GPU/NPU 进行加速
+        _yolo_model = YOLO("yolov8n-pose_openvino_model", task="pose")
     return _yolo_model
+
+
 
 # ============================================================
 # 视频处理核心函数
@@ -101,7 +113,7 @@ def process_video_to_trackset(
             break
 
         # 【恢复】不抽帧，不压缩 imgsz，保证追踪器连续性和关键点精度
-        results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False, device="cpu")
+        results = model.track(frame, persist=True, tracker="botsort.yaml", verbose=False)
         
         if len(results) > 0 and results[0].keypoints is not None:
             track_ids = results[0].boxes.id
@@ -110,7 +122,10 @@ def process_video_to_trackset(
                 continue
                 
             track_ids = track_ids.int().cpu().tolist()
+            
+            # 提取坐标 (x, y) 和 置信度 (conf)
             kpts_xyn = results[0].keypoints.xyn.cpu().numpy()
+            kpts_conf = results[0].keypoints.conf.cpu().numpy() if results[0].keypoints.conf is not None else None
 
             for person_idx, person_kpts in enumerate(kpts_xyn):
                 if person_idx >= len(track_ids):
@@ -118,12 +133,20 @@ def process_video_to_trackset(
                     
                 track_id = track_ids[person_idx]
                 keypoints_dict: Keypoints = {}
+                
                 for i, name in enumerate(COCO17_KEYPOINT_NAMES):
                     if i < len(person_kpts):
                         x, y = person_kpts[i]
-                        keypoints_dict[name] = [float(x), float(y)]
+                        # 安全提取置信度
+                        conf = float(kpts_conf[person_idx][i]) if kpts_conf is not None else 1.0
+                        
+                        if x == 0.0 and y == 0.0:
+                            keypoints_dict[name] = [0.0, 0.0, 0.0]
+                        else:
+                            # 组装为 [x, y, conf]
+                            keypoints_dict[name] = [float(x), float(y), conf]
                     else:
-                        keypoints_dict[name] = [0.0, 0.0]
+                        keypoints_dict[name] = [0.0, 0.0, 0.0]
                 
                 if track_id not in tracks_dict:
                     tracks_dict[track_id] = SkeletonTrack(track_id=track_id, role="child")
@@ -138,6 +161,24 @@ def process_video_to_trackset(
     if not tracks_dict:
         print(f"[WARNING] 视频中未检测到任何人：{video_path}")
         return None
+
+    # 【实战优化：时空绝对对齐】
+    # YOLO 追踪的轨迹是碎片的。必须将所有轨迹用空数据填充到相同的总帧数，
+    # 保证 track.keypoints[i] 永远严格对应视频的物理第 i 帧！
+    empty_kp = {name: [0.0, 0.0, 0.0] for name in COCO17_KEYPOINT_NAMES}
+    for track in tracks_dict.values():
+        aligned_kpts = []
+        for i in range(frame_idx):
+            if i in track.frames:
+                idx = track.frames.index(i)
+                aligned_kpts.append(track.keypoints[idx])
+            else:
+                aligned_kpts.append(empty_kp)
+        track.keypoints = aligned_kpts
+        track.frames = list(range(frame_idx)) # 重写 frames 列表
+
+
+
 
     track_set = TrackSet(
         clip_id=clip_id,
