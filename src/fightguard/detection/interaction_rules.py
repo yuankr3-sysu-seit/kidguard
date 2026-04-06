@@ -207,7 +207,7 @@ def compute_confidence_suppression(
     track_a: SkeletonTrack, 
     track_b: SkeletonTrack, 
     frame_idx: int,
-    tau_c: float = 0.5
+    tau_c: float = 0.5723
 ) -> float:
     """计算置信度抑制系数 γ
     公式：
@@ -264,13 +264,13 @@ class CaptainStateMachine:
         self.tau_dist = rules.get("tau_dist", 2.0)
         self.W = rules.get("W", 2)
         self.R = rules.get("R", 15)
-        self.tau_v = rules.get("tau_v", 0.3)
-        self.tau_a = rules.get("tau_a", 0.4)
+        self.tau_v = rules.get("tau_v", 0.6757)
+        self.tau_a = rules.get("tau_a", 0.4240)
         self.tau_alpha = rules.get("tau_alpha", 0.3)
-        self.tau_phi = rules.get("tau_phi", 0.1)
-        self.tau_p = rules.get("tau_p", 0.2)
-        self.alert_threshold = rules.get("alert_threshold", 0.2)
-        self.M = rules.get("M", 10)
+        self.tau_phi = rules.get("tau_phi", 14.9127)
+        self.tau_p = rules.get("tau_p", 0.9848)
+        self.alert_threshold = rules.get("alert_threshold", 0.3136)
+        self.M = rules.get("M", 5)
         
         # 状态机状态
         self.state = 0  # 0: 初始状态, 1: 接近阶段, 2: 动作激活阶段, 3: 作用-响应阶段
