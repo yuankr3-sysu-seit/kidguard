@@ -87,12 +87,24 @@ def extract_window_features_from_trackset(track_set: TrackSet, cfg: dict) -> Lis
                     window_a = [f['r_a'] for f in window_features[-window_size:]]
                     window_v = [f['r_v'] for f in window_features[-window_size:]]
                     
-                    # 计算统计特征
+                    # 计算统计特征（增强版）
+                    # 加速度特征
+                    window_a_array = np.array(window_a)
+                    # 相对速度特征
+                    window_v_array = np.array(window_v)
+                    
                     feature_dict = {
-                        'accel_mean': np.mean(window_a),
-                        'accel_var': np.var(window_a),
-                        'rel_vel_mean': np.mean(window_v),
-                        'rel_vel_var': np.var(window_v),
+                        # 基本统计
+                        'accel_mean': np.mean(window_a_array),
+                        'accel_var': np.var(window_a_array),
+                        'accel_range': np.max(window_a_array) - np.min(window_a_array) if len(window_a_array) > 0 else 0.0,
+                        'accel_energy': np.sum(window_a_array ** 2) if len(window_a_array) > 0 else 0.0,
+                        # 相对速度统计
+                        'rel_vel_mean': np.mean(window_v_array),
+                        'rel_vel_var': np.var(window_v_array),
+                        'rel_vel_range': np.max(window_v_array) - np.min(window_v_array) if len(window_v_array) > 0 else 0.0,
+                        'rel_vel_energy': np.sum(window_v_array ** 2) if len(window_v_array) > 0 else 0.0,
+                        # 标签和元数据
                         'label': track_set.label if track_set.label in [0, 1] else -1,
                         'clip_id': track_set.clip_id,
                         'window_start': fi - window_size + 1,
@@ -221,8 +233,12 @@ def main():
             valid_features.append({
                 'accel_mean': random.uniform(0, 1),
                 'accel_var': random.uniform(0, 0.5),
+                'accel_range': random.uniform(0, 1),
+                'accel_energy': random.uniform(0, 2),
                 'rel_vel_mean': random.uniform(0, 1),
                 'rel_vel_var': random.uniform(0, 0.5),
+                'rel_vel_range': random.uniform(0, 1),
+                'rel_vel_energy': random.uniform(0, 2),
                 'label': random.choice([0, 1]),
                 'clip_id': f'dummy_{i}',
                 'window_start': 0,
@@ -231,8 +247,11 @@ def main():
                 'track_b_id': 1
             })
     
-    # 定义CSV列名
-    feature_columns = ['accel_mean', 'accel_var', 'rel_vel_mean', 'rel_vel_var']
+    # 定义CSV列名（增强版）
+    feature_columns = [
+        'accel_mean', 'accel_var', 'accel_range', 'accel_energy',
+        'rel_vel_mean', 'rel_vel_var', 'rel_vel_range', 'rel_vel_energy'
+    ]
     meta_columns = ['clip_id', 'window_start', 'window_end', 'track_a_id', 'track_b_id', 'label']
     all_columns = meta_columns + feature_columns
     
