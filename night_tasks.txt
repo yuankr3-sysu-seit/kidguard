@@ -1,0 +1,48 @@
+[系统指令]
+你现在处于无人值守的自动化批处理模式。请严格按顺序执行以下算法优化与工程构建任务，每一步修改后必须确保代码能够运行。遇到连续报错超过 3 次请跳过当前小任务，继续执行后续流程。
+
+[任务 1：特征平滑与误报抑制]
+1. 仔细阅读并分析 src/fightguard/detection/interaction_rules.py 和 src/fightguard/contracts.py。
+2. 针对物理特征（特别是加速度 a_A 和相对速度 v_rel），引入 collections.deque 构建长度为 10 帧的滑动窗口。
+3. 计算窗口内的特征方差（Variance）或标准差（Std）。
+4. 修改判定逻辑：如果瞬时值较高，但窗口方差极小（说明是平滑的持续接触，如“拥抱”），请将该帧的冲突判定得分 (score) 乘以 0.5。
+注意：修改完成后，请立即在终端运行 python test_skeleton.py或其他该运行的文件。如果报错，请直接根据输出结果进行修复，无需询问我。
+
+[任务 2：自动化 Debug 循环]
+1. 完成上述修改后，自动运行 python test_skeleton.py。
+2. 如果发生报错，请读取堆栈信息并自动修复，直至测试完全通过。
+注意：修改完成后，请立即在终端运行 python test_skeleton.py或其他该运行的文件。如果报错，请直接根据输出结果进行修复，无需询问我。
+
+
+[任务 3：数据集特征导出]
+1. 编写全新脚本 scripts/export_ml_features.py。
+2. 调用重构后的规则模块，遍历数据集，将提取出的新特征向量导出为规范的 CSV 格式（包含特征列和标签列，0: 正常, 1: 冲突）。
+3. 自动运行该脚本生成 features.csv。
+注意：修改完成后，请立即在终端运行 python test_skeleton.py或其他该运行的文件。如果报错，请直接根据输出结果进行修复，无需询问我。
+
+
+[任务 4：训练基线模型 (Baseline Classifier)]
+1. 编写全新脚本 scripts/train_svm_baseline.py。
+2. 读取上一步生成的 features.csv，使用 sklearn 划分训练集和测试集（8:2）。
+3. 建立并训练一个 SVM 分类器（尝试 RBF 核），请加入基本的 StandardScaler 数据标准化处理。
+4. 将训练好的最佳模型持久化保存到 models/svm_baseline.pkl。
+5. 在脚本末尾打印出测试集的 Accuracy, Precision, 和 Recall。
+注意：修改完成后，请立即在终端运行 python test_skeleton.py或其他该运行的文件。如果报错，请直接根据输出结果进行修复，无需询问我。
+
+
+[任务 5：评估与可视化呈现]
+1. 编写全新脚本 scripts/plot_metrics.py。
+2. 读取训练好的模型和测试数据，生成“混淆矩阵 (Confusion Matrix)”。
+3. 使用 matplotlib 或 seaborn 将图像保存为 logs/confusion_matrix.png，不要调用 plt.show() 阻塞程序。
+注意：修改完成后，请立即在终端运行 python test_skeleton.py或其他应当运行的文件。如果报错，请直接根据输出结果进行修复，无需询问我。
+
+
+[任务 6：代码库清理与文档规范化]
+1. 遍历 src/fightguard/detection/ 下的所有代码文件。
+2. 为核心类和函数补充符合 Google 风格的 Docstring（包含 Args, Returns）。
+3. 清理掉未使用的 import 和废弃的 print 调试语句，确保代码整洁。
+
+[最终收尾]
+任务全部完成后，请在终端输出一份简短的执行总结报告，并执行最后一次 Git Commit。
+
+注意：修改完成后，请立即在终端运行 python test_skeleton.py或其他该运行的文件。如果报错，请直接根据输出结果进行修复，无需询问我。

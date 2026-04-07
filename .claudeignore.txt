@@ -1,0 +1,7 @@
+# .claudeignore
+datasets/
+videos/
+outputs/
+*.mp4
+*.jpg
+__pycache__/

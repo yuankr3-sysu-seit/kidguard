@@ -1,0 +1,16 @@
+# 1. 代理保活 (确认端口 7890)
+$env:HTTP_PROXY="http://127.0.0.1:7890"
+$env:HTTPS_PROXY="http://127.0.0.1:7890"
+
+# 2. 密钥设置
+$env:DEEPSEEK_API_KEY="sk-53afed9470244b54b6e3d591b06cc824"
+
+# 3. Aider 修正版挂机指令
+# --yes: 相当于原来的 --yes-to-all，自动确认文件修改
+# --test: 相当于原来的 --test-command，指定测试命令
+# --auto-test: 修改后自动运行测试
+# --no-auto-commits: (可选) 如果你希望它改完一大段再提交，可以不加，默认是自动 commit 的
+aider --model deepseek/deepseek-chat `
+      --yes `
+      --auto-test `
+      --message-file night_tasks.txt
