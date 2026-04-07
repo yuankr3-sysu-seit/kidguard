@@ -134,6 +134,10 @@ def main():
     print("KidGuard 高效特征导出工具")
     print("="*60)
     
+    # 确保输出目录存在
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    
     # 加载配置
     cfg = get_config()
     
@@ -144,10 +148,25 @@ def main():
     fight_dir = "D:/dataset_1/five_dataset/fight"
     nofight_dir = "D:/dataset_1/five_dataset/nofight"
     
+    # 检查目录是否存在，如果不存在则尝试使用备用路径
     if os.path.exists(fight_dir):
         data_dirs.append(fight_dir)
+    else:
+        print(f"警告: 行为样本目录不存在: {fight_dir}")
+        # 尝试使用相对路径
+        alt_fight = "data/five_dataset/fight"
+        if os.path.exists(alt_fight):
+            data_dirs.append(alt_fight)
+            print(f"      使用备用路径: {alt_fight}")
+    
     if os.path.exists(nofight_dir):
         data_dirs.append(nofight_dir)
+    else:
+        print(f"警告: 行为样本目录不存在: {nofight_dir}")
+        alt_nofight = "data/five_dataset/nofight"
+        if os.path.exists(alt_nofight):
+            data_dirs.append(alt_nofight)
+            print(f"      使用备用路径: {alt_nofight}")
     
     # 2. NTU骨架目录
     ntu_dirs = [

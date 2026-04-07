@@ -25,7 +25,62 @@ def run_demo():
     
     if not os.path.exists(video_path):
         print(f"[ERROR] 找不到演示视频: {video_path}")
-        return
+        # 尝试使用备用路径
+        alt_video_path = "data/five_dataset/fight/cam1_1.mp4"
+        if os.path.exists(alt_video_path):
+            video_path = alt_video_path
+            print(f"      使用备用视频路径: {video_path}")
+        else:
+            print("      跳过视频处理，继续执行其他测试...")
+            # 创建一个虚拟的TrackSet用于测试
+            from fightguard.contracts import TrackSet, SkeletonTrack, Keypoints
+            from fightguard.inputs.skeleton_source import make_empty_keypoints
+            import random
+            
+            # 创建虚拟数据
+            tracks = []
+            for i in range(2):
+                keypoints_list = []
+                for _ in range(30):
+                    kp = make_empty_keypoints()
+                    # 设置一些随机关键点
+                    for key in kp.keys():
+                        kp[key] = [random.uniform(0, 1), random.uniform(0, 1), random.uniform(0.5, 1.0)]
+                    keypoints_list.append(kp)
+                track = SkeletonTrack(
+                    track_id=i,
+                    role="child" if i == 0 else "teacher",
+                    frames=list(range(30)),
+                    keypoints=keypoints_list,
+                    confidences=[1.0]*30
+                )
+                tracks.append(track)
+            
+            track_set = TrackSet(
+                clip_id="dummy_clip",
+                label=1,
+                tracks=tracks,
+                fps=30.0,
+                total_frames=30
+            )
+            
+            # 运行规则
+            print("\n[3/3] 正在使用虚拟数据测试规则引擎...")
+            events = run_rules_symmetric(track_set, cfg)
+            
+            print("\n" + "="*60)
+            print(" 虚拟数据测试结果")
+            print("="*60)
+            if events:
+                for i, e in enumerate(events):
+                    print(f" [报警 {i+1}] 发现冲突行为！")
+                    print(f"   - 发生时间: 帧 {e.start_frame} ~ {e.end_frame}")
+                    print(f"   - 冲突对象: Track {e.track_ids[0]} 与 Track {e.track_ids[1]}")
+                    print(f"   - 危险得分: {e.score:.3f}")
+            else:
+                print(" [正常] 规则引擎分析完毕，未达到冲突报警阈值。")
+            print("="*60)
+            return
 
     print(f"\n[1/3] 正在加载视频并提取骨骼轨迹...")
     print(f"      输入视频: {os.path.basename(video_path)}")
