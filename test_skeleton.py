@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, "src")
 
 from fightguard.inputs.video_source import process_video_to_trackset
-from fightguard.detection.interaction_rules import run_rules_symmetric
+from fightguard.detection.interaction_rules import run_rules_symmetric, compute_frame_score
 from fightguard.config import get_config
 
 def run_demo():
