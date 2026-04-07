@@ -252,7 +252,77 @@ def compute_confidence_suppression(
 
 
 # ============================================================
-# 第五部分：四段式状态机
+# 第五部分：滑动窗口特征处理器
+# ============================================================
+
+class SlidingWindowFeatureProcessor:
+    """滑动窗口特征处理器，用于计算特征在过去若干帧内的统计特性"""
+    
+    def __init__(self, window_size: int = 10):
+        self.window_size = window_size
+        # 存储各个特征的窗口数据
+        self.feature_windows = {
+            'r_a': [],
+            'r_v': [],
+            'r_alpha': [],
+            'r_phi': [],
+            'r_p': []
+        }
+    
+    def update(self, features: dict):
+        """更新特征窗口"""
+        for key in self.feature_windows:
+            if key in features:
+                self.feature_windows[key].append(features[key])
+                # 保持窗口大小
+                if len(self.feature_windows[key]) > self.window_size:
+                    self.feature_windows[key].pop(0)
+    
+    def compute_statistics(self) -> dict:
+        """计算所有特征的统计信息：标准差和过零率"""
+        stats = {}
+        for key, window in self.feature_windows.items():
+            if len(window) < 2:
+                stats[f'{key}_std'] = 0.0
+                stats[f'{key}_zcr'] = 0.0
+                continue
+            
+            # 计算标准差
+            mean_val = sum(window) / len(window)
+            variance = sum((x - mean_val) ** 2 for x in window) / len(window)
+            std_val = variance ** 0.5
+            stats[f'{key}_std'] = std_val
+            
+            # 计算过零率
+            zero_crossings = 0
+            for i in range(1, len(window)):
+                if (window[i-1] - mean_val) * (window[i] - mean_val) < 0:
+                    zero_crossings += 1
+            zcr = zero_crossings / (len(window) - 1)
+            stats[f'{key}_zcr'] = zcr
+        
+        return stats
+    
+    def get_aggregated_volatility(self) -> float:
+        """获取综合波动性指标，用于区分冲突和拥抱"""
+        stats = self.compute_statistics()
+        # 冲突的特征通常有更高的标准差和过零率
+        # 我们可以计算一个综合波动性分数
+        std_keys = [key for key in stats if key.endswith('_std')]
+        if not std_keys:
+            return 0.0
+        
+        # 平均标准差
+        avg_std = sum(stats[key] for key in std_keys) / len(std_keys)
+        return avg_std
+    
+    def reset(self):
+        """重置所有窗口"""
+        for key in self.feature_windows:
+            self.feature_windows[key] = []
+
+# ============================================================
+# 第六部分：四段式状态机
 # ============================================================
 
 class CaptainStateMachine:
@@ -281,6 +351,9 @@ class CaptainStateMachine:
         self.confirm_window = rules.get("confirm_window", 5)
         self.min_confirm_frames = rules.get("min_confirm_frames", 3)
         
+        # 【防线 3：特征波动性过滤】用于区分冲突和拥抱
+        self.tau_volatility = rules.get("tau_volatility", 0.1)
+        
         # 状态机状态
         self.state = 0  # 0: 初始状态, 1: 接近阶段, 2: 动作激活阶段, 3: 作用-响应阶段
         self.prox_buffer = 0
@@ -290,6 +363,9 @@ class CaptainStateMachine:
         
         # 【防线 2 专用】作用-响应阶段的时间窗计数
         self.response_history = []  # 记录最近 confirm_window 帧是否满足作用-响应条件
+        
+        # 【防线 3 专用】滑动窗口特征处理器
+        self.feature_processor = SlidingWindowFeatureProcessor(window_size=10)
     
     def update(self, dist: float, details_ab: dict, details_ba: dict, score_pair: float) -> Tuple[bool, float]:
         """状态机更新
@@ -414,7 +490,8 @@ class CaptainStateMachine:
 # ============================================================
 
 def compute_directional_score(
-    track_a: SkeletonTrack, track_b: SkeletonTrack, frame_idx: int, cfg: dict, dt: float
+    track_a: SkeletonTrack, track_b: SkeletonTrack, frame_idx: int, cfg: dict, dt: float,
+    feature_processor: Optional[SlidingWindowFeatureProcessor] = None
 ) -> Tuple[float, dict]:
     """计算单向 (A -> B) 的综合得分与特征详情"""
     # 1. 计算归一化尺度
@@ -451,12 +528,36 @@ def compute_directional_score(
     tau_c = cfg.get("rules", {}).get("tau_c", 0.5)
     gamma_t = compute_confidence_suppression(track_a, track_b, frame_idx, tau_c=tau_c)
     
-    # 6. 最终单向得分
-    score_final = gamma_t * score_base
+    # 6. 考虑特征波动性来调整得分
+    # 如果特征波动性低（可能是拥抱），则降低得分
+    volatility_factor = 1.0
+    if feature_processor is not None:
+        # 更新特征处理器
+        current_features = {
+            'r_a': r_a,
+            'r_v': r_v,
+            'r_alpha': r_alpha,
+            'r_phi': r_phi,
+            'r_p': r_p
+        }
+        feature_processor.update(current_features)
+        
+        # 获取综合波动性
+        volatility = feature_processor.get_aggregated_volatility()
+        # 从配置中获取波动性阈值，默认0.1
+        tau_volatility = cfg.get("rules", {}).get("tau_volatility", 0.1)
+        
+        # 如果波动性低于阈值，可能是拥抱等平稳互动，降低得分
+        if volatility < tau_volatility:
+            # 波动性越低，抑制因子越小，但不要完全抑制
+            volatility_factor = max(0.3, volatility / tau_volatility)
+    
+    # 7. 最终单向得分
+    score_final = gamma_t * score_base * volatility_factor
     
     details = {
         "r_a": r_a, "r_v": r_v, "r_alpha": r_alpha, "r_phi": r_phi, "r_p": r_p,
-        "gamma": gamma_t
+        "gamma": gamma_t, "volatility_factor": volatility_factor
     }
     return score_final, details
 
@@ -494,9 +595,9 @@ def run_rules_on_clip(
             if dist is None:
                 dist = float("inf")
             
-            # 2. 双向评分计算
-            score_ab, det_ab = compute_directional_score(track_a, track_b, fi, cfg, dt)
-            score_ba, det_ba = compute_directional_score(track_b, track_a, fi, cfg, dt)
+            # 2. 双向评分计算，传入特征处理器
+            score_ab, det_ab = compute_directional_score(track_a, track_b, fi, cfg, dt, fsm.feature_processor)
+            score_ba, det_ba = compute_directional_score(track_b, track_a, fi, cfg, dt, fsm.feature_processor)
             
             # 3. 取主导分数
             score_pair = max(score_ab, score_ba)
