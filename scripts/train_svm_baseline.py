@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score, precision_score, recall_score, classification_report
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
 
 def main():
     """主函数"""
@@ -32,8 +32,7 @@ def main():
     df = pd.read_csv(feature_file)
     
     # 检查必要的列
-    required_feature_cols = ['r_a', 'r_v', 'r_alpha', 'r_phi', 'r_p', 
-                            'gamma', 'volatility_factor', 'smoothing_factor']
+    required_feature_cols = ['accel_mean', 'accel_var', 'rel_vel_mean', 'rel_vel_var']
     required_meta_cols = ['label']
     
     for col in required_feature_cols + required_meta_cols:
@@ -74,11 +73,13 @@ def main():
     accuracy = accuracy_score(y_test, y_pred)
     precision = precision_score(y_test, y_pred, zero_division=0)
     recall = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
     
     print("\n测试集性能指标:")
     print(f"  准确率 (Accuracy): {accuracy:.4f}")
     print(f"  精确率 (Precision): {precision:.4f}")
     print(f"  召回率 (Recall): {recall:.4f}")
+    print(f"  F1-score: {f1:.4f}")
     
     print("\n详细分类报告:")
     print(classification_report(y_test, y_pred, target_names=['正常', '冲突']))
