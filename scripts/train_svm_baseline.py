@@ -133,9 +133,6 @@ def main():
     # 在测试集上评估
     y_pred = svm.predict(X_test_scaled)
     
-    # 在测试集上评估
-    y_pred = svm.predict(X_test_scaled)
-    
     # 计算指标
     accuracy = accuracy_score(y_test, y_pred)
     precision = precision_score(y_test, y_pred, zero_division=0)
@@ -150,6 +147,10 @@ def main():
     
     print("\n详细分类报告:")
     print(classification_report(y_test, y_pred, target_names=['正常', '冲突']))
+    
+    # 创建模型目录
+    model_dir = "models"
+    os.makedirs(model_dir, exist_ok=True)
     
     # 绘制混淆矩阵
     cm = confusion_matrix(y_test, y_pred)
@@ -200,10 +201,7 @@ def main():
             print(f"  召回率 (Recall): {recall:.4f}")
             print(f"  F1-score: {f1:.4f}")
     
-    # 保存模型和标准化器
-    model_dir = "models"
-    os.makedirs(model_dir, exist_ok=True)
-    
+    # 保存SVM模型和标准化器
     model_path = os.path.join(model_dir, "svm_baseline.pkl")
     scaler_path = os.path.join(model_dir, "scaler.pkl")
     
@@ -213,7 +211,7 @@ def main():
     with open(scaler_path, 'wb') as f:
         pickle.dump(scaler, f)
     
-    print(f"\n模型已保存到: {model_path}")
+    print(f"\nSVM模型已保存到: {model_path}")
     print(f"标准化器已保存到: {scaler_path}")
     
     # 保存测试集预测结果用于后续分析
