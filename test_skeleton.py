@@ -18,6 +18,8 @@ def run_demo():
     cfg["rules"]["proximity_window_frames"] = 2  # 只要连续2帧近身就触发
     cfg["rules"]["smoothing_window_frames"] = 2  # 滑窗缩短到2帧，不稀释瞬间爆发
     cfg["rules"]["alert_threshold"] = 0.20       # 2D 画面特征幅度变小，适当降低报警门槛
+    # 调整特征波动性阈值以适应真实视频
+    cfg["rules"]["tau_volatility"] = 0.08        # 真实视频中特征波动可能更小
 
     video_path = "D:/dataset_1/five_dataset/fight/cam1_1.mp4" # 确保路径正确
     

@@ -32,6 +32,8 @@ def evaluate_on_videos(num_samples_per_class: int = 5):
     cfg["rules"]["proximity_window_frames"] = 2  
     cfg["rules"]["smoothing_window_frames"] = 2  
     cfg["rules"]["alert_threshold"] = 0.20       
+    # 调整特征波动性阈值以适应真实视频
+    cfg["rules"]["tau_volatility"] = 0.08        
     
     dataset_dir = "D:/dataset_1/five_dataset"
     fight_dir = os.path.join(dataset_dir, "fight")
