@@ -8,10 +8,12 @@ interaction_rules.py — 交互规则与状态机模块
 3. 相对接近速度强制约束
 4. 骨盆速度特征
 5. 置信度抑制机制
+6. 特征平滑与误报抑制
 """
 
 import math
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
+from collections import deque
 
 from fightguard.contracts import InteractionEvent, SkeletonTrack, TrackSet
 from fightguard.config import get_config
@@ -26,6 +28,61 @@ from fightguard.detection.math_utils import (
 # ============================================================
 # 第一部分：基础几何与物理标尺计算
 # ============================================================
+
+class FeatureSmoothingWindow:
+    """
+    管理特征滑动窗口以进行方差计算，用于误报抑制。
+    
+    Attributes:
+        window_size (int): 滑动窗口大小
+        a_window (deque): 加速度特征窗口
+        v_window (deque): 相对速度特征窗口
+    """
+    def __init__(self, window_size: int = 10):
+        """
+        初始化特征平滑窗口。
+        
+        Args:
+            window_size: 滑动窗口大小，默认为10帧
+        """
+        self.window_size = window_size
+        self.a_window = deque(maxlen=window_size)
+        self.v_window = deque(maxlen=window_size)
+        
+    def update(self, a_value: float, v_value: float):
+        """
+        更新窗口中的特征值。
+        
+        Args:
+            a_value: 加速度特征值
+            v_value: 相对速度特征值
+        """
+        self.a_window.append(a_value)
+        self.v_window.append(v_value)
+        
+    def get_variance_factor(self) -> float:
+        """
+        计算方差因子，用于调整得分。
+        
+        Returns:
+            float: 如果方差很小（平滑接触），返回0.5，否则返回1.0
+        """
+        if len(self.a_window) < 3 or len(self.v_window) < 3:
+            return 1.0
+            
+        # 计算a特征的方差
+        a_mean = sum(self.a_window) / len(self.a_window)
+        a_variance = sum((x - a_mean) ** 2 for x in self.a_window) / len(self.a_window)
+        
+        # 计算v特征的方差
+        v_mean = sum(self.v_window) / len(self.v_window)
+        v_variance = sum((x - v_mean) ** 2 for x in self.v_window) / len(self.v_window)
+        
+        # 如果两个特征的方差都很小，说明是平滑接触
+        if a_variance < 0.01 and v_variance < 0.01:
+            return 0.5
+        else:
+            return 1.0
 
 
 
